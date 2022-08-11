@@ -1,5 +1,5 @@
 # Storage Device I/O Testing Tool
-_A multithreaded I/O testing tool designed for physical storage devices on Windows_
+_A multithreaded I/O testing tool designed for physical storage devices on Windows. Written in Rust and PowerShell using the Win32 SDK_
 
 ## _About_
 This CLI allows you to run multithreaded read/write operations on physical storage devices
@@ -10,7 +10,7 @@ This CLI allows you to run multithreaded read/write operations on physical stora
 
 [Rust](https://www.rust-lang.org/tools/install)
 
-[Cargo](https://pypi.org/project/psutil/) (installed automatically)
+[Cargo](https://pypi.org/project/psutil/)
 
 [PowerShell](https://docs.microsoft.com/en-us/powershell/scripting/install/installing-powershell?view=powershell-7.2)
 
