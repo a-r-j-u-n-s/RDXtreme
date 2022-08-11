@@ -24,6 +24,7 @@ This CLI allows you to run multithreaded read/write operations on physical stora
 
 ## Usage
 Run `physical_disks.exe -a` in PowerShell to see a list of your machine's physical disks along with partition information, device health, etc.
+`-t` flag is optional and used to specify number of threads for a multithreaded I/O operation (concurrent)
 
 1. Reads
 	```
