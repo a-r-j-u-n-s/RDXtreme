@@ -1,0 +1,1 @@
+Write-Host (Get-PhysicalDisk | Sort-Object -Property { [int]$_.DeviceId } | Select-Object DeviceId, DeviceId, FriendlyName, SerialNumber, MediaType)
