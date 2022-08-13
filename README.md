@@ -2,7 +2,7 @@
 _A multithreaded I/O testing tool designed for physical storage devices on Windows. Written in Rust and PowerShell using the Win32 SDK_
 
 ## _About_
-This CLI allows you to run multithreaded read/write operations on physical storage devices
+This CLI allows you to run multithreaded read/write operations on and analyze disk information of physical storage devices
 
 ## Dependencies
 
