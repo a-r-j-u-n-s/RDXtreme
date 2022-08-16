@@ -296,18 +296,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b1141d4d61095b28419e22cb0bbf02755f5e54e0526f97f1e3d1d160e60885fb"
 
 [[package]]
-name = "unbuffered_io"
-version = "0.1.0"
-dependencies = [
- "clap",
- "powershell_script",
- "sysinfo",
- "winapi",
- "windows",
- "windows-drives",
-]
-
-[[package]]
 name = "unicode-ident"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -396,3 +384,15 @@ name = "windows_x86_64_msvc"
 version = "0.39.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5e4d40883ae9cae962787ca76ba76390ffa29214667a111db9e0a1ad8377e809"
+
+[[package]]
+name = "yant"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "powershell_script",
+ "sysinfo",
+ "winapi",
+ "windows",
+ "windows-drives",
+]

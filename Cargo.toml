@@ -1,5 +1,5 @@
 [package]
-name = "unbuffered_io"
+name = "storageiotool"
 version = "0.1.0"
 edition = "2021"
 
@@ -11,6 +11,7 @@ clap = "3.0.0-beta.4"
 windows-drives = "0.5.0"
 powershell_script = "1.0.2"
 winapi = "0.3.9"
+affinity = "0.1.2"
 
 [dependencies.windows]
 version = "0.39.0"
@@ -21,4 +22,5 @@ features = [
     "Win32_Security",
     "Win32_System_Threading",
     "Win32_Storage_FileSystem",
+    "Win32_System_Ioctl",
 ]

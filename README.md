@@ -1,8 +1,8 @@
 # Storage Device I/O Testing Tool
-_A multithreaded I/O testing tool designed for physical storage devices on Windows_
+_A multithreaded I/O testing tool designed for physical storage devices
 
 ## _About_
-This CLI allows you to run multithreaded read/write operations on physical storage devices
+This CLI allows you to run multithreaded read/write operations on physical storage devices. Users can specify the number of threads, I/O limits, and specific data patterns to write for testing purposes. 
 
 ## Dependencies
 
@@ -27,10 +27,10 @@ Run `physical_disks.exe -a` in PowerShell to see a list of your machine's physic
 
 1. Reads
 	```
-	unbuffered_io.exe -r [disk #] -t [THREADS]
+	storageiotool.exe -r [disk #] -t [THREADS] -p [PATTERN] [-l] [LIMIT (in GB)]
 	```
 2. Writes
 	```
-	unbuffered_io.exe -w [disk #] -t [THREADS]
+	storagetiotool.exe -w [disk #] -t [THREADS] -p [PATTERN] [-l] [LIMIT (in GB)]
 	```
 
