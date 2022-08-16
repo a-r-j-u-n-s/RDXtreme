@@ -6,9 +6,14 @@ use clap::Arg;
 use std::{time::Instant, mem::{size_of, drop}, ptr::{null_mut, null}, process::exit, thread, string::String, sync::mpsc::{channel, Sender, Receiver}};
 use winapi::{shared::minwindef::{DWORD, LPVOID}, um::{fileapi::OPEN_EXISTING, winbase::FILE_FLAG_NO_BUFFERING, winnt::{FILE_SHARE_READ, FILE_SHARE_WRITE, GENERIC_WRITE, GENERIC_READ, MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READWRITE}, memoryapi::VirtualAlloc}};
 use affinity::*;
+use clap::Parser;
+use std::num::ParseIntError;
 
+// Sector aligned constants
 const MEGABYTE: u64 = 1048576;
+const GIGABYTE: u64 = 1073741824;
 const PAGE_SIZE: u64 = 4096;
+
 const NVME_MAX_LOG_SIZE: u64 = 0x1000;
 
 fn main() {
@@ -35,6 +40,17 @@ fn main() {
             .long("read")
             .takes_value(true)
             .help("Specify physical disk ID to read from"))
+        .arg(Arg::new("limit")
+            .short('l')
+            .long("limit")
+            .takes_value(true)
+            .help("Limit (in GB) I/O size for read/write operation"))
+        .arg(Arg::new("pattern")
+            .short('p')
+            .long("pattern")
+            .takes_value(true)
+            .default_value("0123456789abcdef")
+            .help("Data pattern for write comparisons"))
         .arg(Arg::new("controller")
             .short('c')
             .long("controller")
@@ -44,7 +60,7 @@ fn main() {
             .short('n')
             .long("namespace")
             .takes_value(true)
-            .help("Display nanespace information for NVMe device"))
+            .help("Display namespace information for NVMe device"))
         .get_matches();
 
     let partitions: u8;
@@ -52,10 +68,10 @@ fn main() {
     let mut threads: u64 = 1;
     let io_type: char;      // Identifier for opening handle and conducting IO
     if args.is_present("threads") {
-        threads = args.value_of("threads").unwrap().parse().expect("Number of threads must be a valid integer");
+        threads = args.value_of("threads").unwrap().parse().expect("Limit must be a positive integer");
     }
     if args.is_present("read") {
-        disk_number = args.value_of("read").unwrap().parse().expect("Disk number must be a valid integer!");
+        disk_number = args.value_of("read").unwrap().parse().expect("Disk number must be a valid integer");
         partitions = get_partitions(disk_number);
         if partitions > 1 {
             println!("Cannot conduct read IO operations on disk with multiple partitions, exiting...");
@@ -63,7 +79,7 @@ fn main() {
         }
         io_type = 'r';
     } else if args.is_present("write") {
-        disk_number = args.value_of("write").unwrap().parse().expect("Disk number must be a valid integer!");
+        disk_number = args.value_of("write").unwrap().parse().expect("Disk number must be a valid integer");
         partitions = get_partitions(disk_number);
         if partitions > 1 {
             println!("Cannot conduct write IO operations on disk with multiple partitions, exiting...");
@@ -71,32 +87,45 @@ fn main() {
         }
         io_type = 'w';
     } else {
-        // Get Identify Controller, Namespace, FirmwareInfo
+        // TODO: Get Identify Controller
         if args.is_present("controller") {
             disk_number = args.value_of("controller").unwrap().parse().expect("Disk number must be a valid integer!");
             let path = format_drive_num(disk_number);
             let handle: Foundation::HANDLE = open_handle(&path, 'r').unwrap();
             id_controller(handle);
             return;
+
+        // TODO: Get Identify Namespace
+
+        // TODO: Get Firmware Info
         }
 
-        println!("Please specify an IO operation (see --help for more information)");
+        println!("Please specify an IO operation (--help for more information)");
         exit(0);
     }
+
     // Threading logic to handle reads/writes
     let num_threads = threads;
     let (sender, receiver): (Sender<String>, Receiver<String>) = channel();
     let (size, io_size, sector_size) = calculate_disk_info(disk_number);
+    let mut limit = size;
+    if args.is_present("limit") {
+        limit = args.value_of("threads").unwrap().parse().expect("Number of threads must be a valid integer");
+        limit *= GIGABYTE;
+    }
+    
     println!("Disk {} size: {} bytes", disk_number, size);
-    let cores_in_group = get_core_num();
-    println!("Cores: {}", cores_in_group);
+    let num_cores = get_core_num();     // CPU cores in the current processor group
+    
     while threads != 0 {
         let sen_clone = sender.clone();
-        if io_type == 'r' {
-            thread::spawn(move || thread_read(sen_clone, disk_number, num_threads, threads.clone(), size, io_size, sector_size));
-        } else if io_type == 'w' {
-            thread::spawn(move || thread_write(sen_clone, disk_number, num_threads, threads.clone(), size, io_size, sector_size));
-        }
+        thread::spawn(move || {
+            // Pin thread to single CPU core in first processor group
+            let affinity: Vec<usize> = vec![(threads % num_cores as u64) as usize; 1];
+            let _ = set_thread_affinity(affinity);
+            // println!("Thread {} at Core: {}", threads, get_thread_affinity().unwrap()[0]);  // For debugging purposes
+            thread_io(sen_clone, disk_number, num_threads, threads.clone(), size, io_size, limit, io_type);
+        });
         threads -= 1;
     }
 
@@ -177,24 +206,27 @@ fn open_handle(path: &str, handle_type: char) -> Result<Foundation::HANDLE, Stri
     }
 }
 
-
-// Conduct multithreaded write operation
-fn thread_write(senderr: std::sync::mpsc::Sender<String>, disk_number: u8, num_threads: u64, id: u64, size: u64, writesize: u64, sector_size: u64) {
-    // println!("Starting thread {}", id);    // For debugging purposes
-    let full_write_size = size / num_threads;
+// Conduct threaded IO operation (read/write)
+fn thread_io(senderr: std::sync::mpsc::Sender<String>, disk_number: u8, num_threads: u64, id: u64, size: u64, io_size: u64, limit: u64, io_type: char) {
+    let full_io_size = limit / num_threads;
     let path = format_drive_num(disk_number);
-    let handle = open_handle(&path, 'w').unwrap();
+    let handle = open_handle(&path, io_type).unwrap();
 
-    // Set up FilePointer to start write at offset based on thread number
-    let mut offset = (id - 1) * full_write_size;
-    
-    // Reset offset if not an even multiple of sector size
+    // Set up FilePointer to start read at offset based on thread number
+    let mut offset = (id - 1) * full_io_size;
+
+    // Reset offset if not an even multiple of page size (4k bytes)
     offset = calculate_io_size(PAGE_SIZE, offset);
+
+    let mut initialization_offset = 0;
+    if io_type == 'w' {
+        initialization_offset += MEGABYTE;
+    }
 
     let _pointer = unsafe {
         FileSystem::SetFilePointerEx(
             handle,
-            (MEGABYTE + offset) as i64,     // Increase offset by 1 MB to avoid overwriting index table and other initialization data
+            (offset + initialization_offset) as i64,
             null_mut(),
             FileSystem::FILE_BEGIN
         )
@@ -204,98 +236,59 @@ fn thread_write(senderr: std::sync::mpsc::Sender<String>, disk_number: u8, num_t
     let buffer: LPVOID = unsafe {
         VirtualAlloc(
             null_mut(),
-            writesize as usize,
+            io_size as usize,
             MEM_COMMIT | MEM_RESERVE,
             PAGE_EXECUTE_READWRITE
         )
     };
 
-    let mut bytes_written: u32 = 0;
-    let bytes_written_ptr: *mut u32 = &mut bytes_written;
+    let mut bytes_completed: u32 = 0;
+    let bytes_completed_ptr: *mut u32 = &mut bytes_completed;
     let mut pos: u64 = offset;
-    let last_pos = full_write_size * id - writesize;
+    let last_pos = full_io_size * id - io_size;
 
-    let now = Instant::now();
-    while pos <= last_pos {
-        let write = unsafe {
-            FileSystem::WriteFile(
-                handle,
-                buffer,
-                writesize as DWORD,
-                bytes_written_ptr,
-                null_mut()
-            )
-        };
-        pos += bytes_written as u64;
-        if write == false {
-            println!("Thread {} encountered Error Code {}", id, win32::last_error());
-            break;
+    if io_type == 'w' {
+        let now = Instant::now();
+        while pos <= last_pos {
+            let write = unsafe {
+                FileSystem::WriteFile(
+                    handle,
+                    buffer,
+                    io_size as DWORD,
+                    bytes_completed_ptr,
+                    null_mut()
+                )
+            };
+            pos += bytes_completed as u64;
+            if write == false {
+                println!("Thread {} encountered Error Code {}", id, win32::last_error());
+                break;
+            }
+    }
+        let elapsed_time = now.elapsed();
+        println!("Thread {} took {} seconds to finish writing", id, elapsed_time.as_secs());
+    } else if io_type == 'r' {
+        let now = Instant::now();
+        while pos <= last_pos {
+            let read = unsafe {
+                FileSystem::ReadFile(
+                    handle,
+                    buffer,
+                    io_size as DWORD,
+                    bytes_completed_ptr,
+                    null_mut()
+                )
+            };
+            pos += bytes_completed as u64;
+            if read == false { 
+                println!("Thread {} encountered Error Code {}", id, win32::last_error());
+                break;
+            }
         }
+        let elapsed_time = now.elapsed();
+        println!("Thread {} took {} seconds to finish reading", id, elapsed_time.as_secs());
     }
-    let elapsed_time = now.elapsed();
-    println!("Thread {} took {} seconds to finish", id, elapsed_time.as_secs());
-    unsafe {
-        Foundation::CloseHandle(handle);
-    }
-    senderr.send(format!("finished|{}", id)).unwrap();
-}
 
-
-// Conduct multithreaded read operation
-fn thread_read(senderr: std::sync::mpsc::Sender<String>, disk_number: u8, num_threads: u64, id: u64, size: u64, readsize: u64, sector_size: u64) {
-    // println!("Starting thread {}", id);    // For debugging purposes
-    let full_read_size = size / num_threads;
-    let path = format_drive_num(disk_number);
-    let handle = open_handle(&path, 'r').unwrap();
-
-    // Set up FilePointer to start read at offset based on thread number
-    let mut offset = (id - 1) * full_read_size;
-
-    // Reset offset if not an even multiple of sector size
-    offset = calculate_io_size(PAGE_SIZE, offset);
-
-    let _pointer = unsafe {
-        FileSystem::SetFilePointerEx(
-            handle,
-            offset as i64,
-            null_mut(),
-            FileSystem::FILE_BEGIN
-        )
-    };
-
-    let buffer: LPVOID = unsafe {
-        VirtualAlloc(
-            null_mut(),
-            readsize as usize,
-            MEM_COMMIT | MEM_RESERVE,
-            PAGE_EXECUTE_READWRITE
-        )
-    };
-
-    let mut bytes_read: u32 = 0;
-    let bytes_read_ptr: *mut u32 = &mut bytes_read;
-    let mut pos: u64 = offset;
-    let last_pos = full_read_size * id - readsize;
-
-    let now = Instant::now();
-    while pos <= last_pos {
-        let read = unsafe {
-            FileSystem::ReadFile(
-                handle,
-                buffer,
-                readsize as DWORD,
-                bytes_read_ptr,
-                null_mut()
-            )
-        };
-        pos += bytes_read as u64;
-        if read == false { 
-            println!("Thread {} encountered Error Code {}", id, win32::last_error());
-            break;
-        }
-    }
-    let elapsed_time = now.elapsed();
-    println!("Thread {} took {} seconds to finish", id, elapsed_time.as_secs());
     unsafe {
         Foundation::CloseHandle(handle);
     }
@@ -331,6 +324,9 @@ fn format_drive_num(drive_num: u8) -> String {
     return format!("\\\\.\\PhysicalDrive{}", drive_num);
 }
 
+fn parse_hex(src: &str) -> Result<u64, ParseIntError> {
+    u64::from_str_radix(src, 16)
+}
 
 // TODO: Retrieve Identify Controller information 
 #[allow(unused)]
@@ -390,4 +386,3 @@ fn id_controller(h_device: Foundation::HANDLE) {
     }
 
 }
-
