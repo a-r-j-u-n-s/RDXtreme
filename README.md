@@ -2,7 +2,7 @@
 _A multithreaded I/O testing tool designed for physical storage devices
 
 ## _About_
-This CLI allows you to run multithreaded read/write operations on physical storage devices. Users can specify the number of threads, I/O limits, and specific data patterns to write for testing purposes. 
+This CLI allows you to run multithreaded read/write operations on physical storage devices. Users can specify the number of threads, I/O limits, and specific data patterns to write for testing purposes.
 
 ## Dependencies
 
@@ -10,7 +10,7 @@ This CLI allows you to run multithreaded read/write operations on physical stora
 
 [Rust](https://www.rust-lang.org/tools/install)
 
-[Cargo](https://pypi.org/project/psutil/) (installed automatically)
+[Cargo](https://www.rust-lang.org/tools/install)
 
 [PowerShell](https://docs.microsoft.com/en-us/powershell/scripting/install/installing-powershell?view=powershell-7.2)
 
@@ -22,7 +22,7 @@ This CLI allows you to run multithreaded read/write operations on physical stora
 3. `cargo build --release` to compile and build .exe
 4. `cargo run -- [FLAGS]` or run exe directly in `target/release/unbuffered_io.exe [FLAGS]`
 
-## Usage
+## _Usage_
 Run `physical_disks.exe -a` in PowerShell to see a list of your machine's physical disks along with partition information, device health, etc.
 
 1. Reads
@@ -31,6 +31,14 @@ Run `physical_disks.exe -a` in PowerShell to see a list of your machine's physic
 	```
 2. Writes
 	```
-	storagetiotool.exe -w [disk #] -t [THREADS] -p [PATTERN] [-l] [LIMIT (in GB)]
+	storagetiotool.exe -w [disk #] -t [THREADS] -p [PATTERN] -l [LIMIT]	
 	```
 
+### Optional Flags
+`-t` : Number of threads to use
+
+`-l` : I/O limit (in GB)
+
+`-p` : Data pattern to use for writes/comparisons
+
+## _Performance_
