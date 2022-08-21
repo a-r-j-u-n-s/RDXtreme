@@ -4,15 +4,15 @@ use sysinfo::SystemExt;
 use powershell_script;
 use clap::Arg;
 use std::{time::Instant, mem::{size_of, drop}, ptr::{null_mut, null}, process::exit, thread, string::String, sync::mpsc::{channel, Sender, Receiver}};
-use winapi::{shared::minwindef::{DWORD, LPVOID}, um::{fileapi::OPEN_EXISTING, winbase::FILE_FLAG_NO_BUFFERING, winnt::{FILE_SHARE_READ, FILE_SHARE_WRITE, GENERIC_WRITE, GENERIC_READ, MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READWRITE}, memoryapi::VirtualAlloc}};
+use winapi::{shared::minwindef::{DWORD, LPVOID}, um::{fileapi::OPEN_EXISTING, winbase::FILE_FLAG_NO_BUFFERING, winnt::{FILE_SHARE_READ, FILE_SHARE_WRITE, GENERIC_WRITE, GENERIC_READ, MEM_COMMIT, MEM_RESERVE, MEM_RELEASE, PAGE_EXECUTE_READWRITE}, memoryapi::{VirtualAlloc, VirtualFree}}};
 use affinity::*;
-use clap::Parser;
 use std::num::ParseIntError;
 
 // Sector aligned constants
 const MEGABYTE: u64 = 1048576;
 const GIGABYTE: u64 = 1073741824;
 const PAGE_SIZE: u64 = 4096;
+const COMPARE_IO_SIZE: usize = 258048/2;        // IO size to use specifically for data comparisons
 
 const NVME_MAX_LOG_SIZE: u64 = 0x1000;
 
@@ -21,10 +21,10 @@ fn main() {
     let mut sysinfo = sysinfo::System::new_all();
     sysinfo.refresh_all();
 
-    let args = clap::App::new("Yet Another NVMe Tool")
+    let args = clap::App::new("Storage IO Test Tool")
         .version("v1.1.0")
         .author("Arjun Srivastava, Microsoft CHIE - ASE")
-        .about("CLI to analyze and conduct multithreaded read/write IO operations on single-partition physical disks")
+        .about("CLI to analyze and conduct multithreaded read/write IO operations and data comparisons on single-partition physical disks")
         .arg(Arg::new("write")
             .short('w')
             .long("write")
@@ -49,8 +49,7 @@ fn main() {
             .short('p')
             .long("pattern")
             .takes_value(true)
-            .default_value("0123456789abcdef")
-            .help("Data pattern for write comparisons"))
+            .help("Data pattern to write to drive"))
         .arg(Arg::new("controller")
             .short('c')
             .long("controller")
@@ -64,11 +63,18 @@ fn main() {
         .get_matches();
 
     let partitions: u8;
+    let mut pattern_str: String;
+    let mut pattern: u64 = 0;
     let disk_number: u8;
     let mut threads: u64 = 1;
     let io_type: char;      // Identifier for opening handle and conducting IO
     if args.is_present("threads") {
-        threads = args.value_of("threads").unwrap().parse().expect("Limit must be a positive integer");
+        threads = args.value_of("threads").unwrap().parse().expect("Thread count must be a positive integer");
+    }
+    if args.is_present("pattern") {
+        pattern_str = args.value_of("pattern").unwrap().parse().expect("Pattern must be a valid string");
+        // pattern_str = String::from("0123456789abcdef");     // Default 64-bit pattern for conducting I/O data comparisons
+        pattern = parse_hex(&pattern_str).unwrap();
     }
     if args.is_present("read") {
         disk_number = args.value_of("read").unwrap().parse().expect("Disk number must be a valid integer");
@@ -110,7 +116,7 @@ fn main() {
     let (size, io_size, sector_size) = calculate_disk_info(disk_number);
     let mut limit = size;
     if args.is_present("limit") {
-        limit = args.value_of("threads").unwrap().parse().expect("Number of threads must be a valid integer");
+        limit = args.value_of("limit").unwrap().parse().expect("I/O limit must be a valid integer");
         limit *= GIGABYTE;
     }
     
@@ -123,8 +129,12 @@ fn main() {
             // Pin thread to single CPU core in first processor group
             let affinity: Vec<usize> = vec![(threads % num_cores as u64) as usize; 1];
             let _ = set_thread_affinity(affinity);
-            // println!("Thread {} at Core: {}", threads, get_thread_affinity().unwrap()[0]);  // For debugging purposes
-            thread_io(sen_clone, disk_number, num_threads, threads.clone(), size, io_size, limit, io_type);
+            // println!("Thread {} at Core: {}", threads, get_thread_affinity().unwrap()[0]);  // For debugging purposes 
+            if pattern != 0 {
+                thread_data_pattern_io(sen_clone, num_threads, threads.clone(), disk_number, pattern, limit, sector_size, io_size);
+            } else {
+                thread_io(sen_clone, disk_number, num_threads, threads.clone(), io_size, limit, io_type, pattern);
+            }
         });
         threads -= 1;
     }
@@ -198,7 +208,7 @@ fn open_handle(path: &str, handle_type: char) -> Result<Foundation::HANDLE, Stri
         let err = win32::last_error();
         Err(match err {
             2 => "could not open handle because the device was not found".to_string(),
-            5 => "could not open handle because access was denied - do you have administrator privileges?".to_string(),
+            5 => "could not open handle because access was denied - enable administrator privileges".to_string(),
             _ => format!("got invalid handle: error code {:#08x}", err)
         })
     } else {
@@ -207,16 +217,16 @@ fn open_handle(path: &str, handle_type: char) -> Result<Foundation::HANDLE, Stri
 }
 
 // Conduct threaded IO operation (read/write)
-fn thread_io(senderr: std::sync::mpsc::Sender<String>, disk_number: u8, num_threads: u64, id: u64, size: u64, io_size: u64, limit: u64, io_type: char) {
-    let full_io_size = limit / num_threads;
-    let path = format_drive_num(disk_number);
-    let handle = open_handle(&path, io_type).unwrap();
+fn thread_io(sender: std::sync::mpsc::Sender<String>, disk_number: u8, num_threads: u64, id: u64, io_size: u64, limit: u64, io_type: char, pattern: u64) {
+    let full_io_size: u64 = limit / num_threads;
+    let path: String = format_drive_num(disk_number);
+    let handle: Foundation::HANDLE = open_handle(&path, io_type).unwrap();
 
-    // Set up FilePointer to start read at offset based on thread number
+    // Set up FilePointer to start at offset based on thread number
     let mut offset = (id - 1) * full_io_size;
 
     // Reset offset if not an even multiple of page size (4k bytes)
-    offset = calculate_io_size(PAGE_SIZE, offset);
+    offset = calculate_nearest_multiple(PAGE_SIZE, offset);
 
     let mut initialization_offset = 0;
     if io_type == 'w' {
@@ -242,10 +252,13 @@ fn thread_io(senderr: std::sync::mpsc::Sender<String>, disk_number: u8, num_thre
         )
     };
 
+    // Add pattern to write buffer (TODO: COPY CODE FROM COMPARE FUNCTION)
+    
+
     let mut bytes_completed: u32 = 0;
     let bytes_completed_ptr: *mut u32 = &mut bytes_completed;
     let mut pos: u64 = offset;
-    let last_pos = full_io_size * id - io_size;
+    let last_pos: u64 = full_io_size * id - io_size;
 
     if io_type == 'w' {
         let now = Instant::now();
@@ -290,9 +303,142 @@ fn thread_io(senderr: std::sync::mpsc::Sender<String>, disk_number: u8, num_thre
     }
 
     unsafe {
+        // Clean up resources
+        VirtualFree(buffer, 0, MEM_RELEASE);
         Foundation::CloseHandle(handle);
     }
-    senderr.send(format!("finished|{}", id)).unwrap();
+    sender.send(format!("finished|{}", id)).unwrap();
+}
+
+
+// Multithreaded write/compare data patterns
+fn thread_data_pattern_io(sender: std::sync::mpsc::Sender<String>, num_threads: u64, id: u64, disk_number: u8, mut pattern: u64, size: u64, sector_size: u64, io_size: u64) {
+    let full_io_size = size / num_threads;
+    let path = format_drive_num(disk_number);
+    let handle = open_handle(&path, 'w').unwrap();
+
+    // Set up FilePointer to start at offset based on thread number
+    let mut offset = (id - 1) * full_io_size;
+
+    // Reset offset if not an even multiple of page size (4k bytes)
+    offset = calculate_nearest_multiple(PAGE_SIZE, offset);
+
+    // Set up data pattern
+    let mut pattern_data: Vec<u64> = vec![pattern; COMPARE_IO_SIZE];
+
+    let mut _pointer = unsafe {
+        FileSystem::SetFilePointerEx(
+            handle,
+            (offset + MEGABYTE) as i64,
+            null_mut(),
+            FileSystem::FILE_BEGIN
+        )
+    };
+
+    // Allocate sector-aligned buffers with Win32 VirtualAlloc
+    let write_buffer: LPVOID = unsafe {
+        VirtualAlloc(
+            null_mut(),
+            COMPARE_IO_SIZE,
+            MEM_COMMIT | MEM_RESERVE,
+            PAGE_EXECUTE_READWRITE
+        )
+    };
+
+    // Dumb but effective (for now) method to move pattern into sector-aligned buffer
+    let buf: *mut [u64; COMPARE_IO_SIZE] = write_buffer as *mut [u64; COMPARE_IO_SIZE];
+    let mut buf_local: [u64; COMPARE_IO_SIZE] = unsafe{*buf};
+    buf_local.copy_from_slice(&pattern_data);       // Copy pattern to local write buffer
+    let buffer_ptr: LPVOID = &mut buf_local as *mut _ as LPVOID;
+
+    let read_buffer: LPVOID = unsafe {
+        VirtualAlloc(
+            null_mut(),
+            COMPARE_IO_SIZE as usize,
+            MEM_COMMIT | MEM_RESERVE,
+            PAGE_EXECUTE_READWRITE
+        )
+    };
+
+    // I/O logistics
+    let mut bytes_completed: u32 = 0;
+    let bytes_completed_ptr: *mut u32 = &mut bytes_completed;
+    let mut pos: u64 = 0;
+    let last_pos = full_io_size * id - io_size;
+
+    let mut iterations: u64 = 0;
+    let mut received: u64;
+
+    // Raw pointer for read buffer
+    let mut read_buffer_ptr: *mut [u64; COMPARE_IO_SIZE];
+    let mut read_buffer_local: [u64; COMPARE_IO_SIZE];
+
+    while pos <= last_pos {
+
+        // Write to drive
+        let write = unsafe {
+            FileSystem::WriteFile(
+                handle,
+                buffer_ptr,
+                COMPARE_IO_SIZE as DWORD,
+                bytes_completed_ptr,
+                null_mut()
+            )
+        };
+
+        // Move pointer back to conduct read
+        _pointer = unsafe {
+            FileSystem::SetFilePointerEx(
+                handle,
+                (bytes_completed as i64 * -1) as i64,
+                null_mut(),
+                FileSystem::FILE_CURRENT
+            )
+        };
+        
+        // Read same segment
+        let read = unsafe {
+            FileSystem::ReadFile(
+                handle,
+                read_buffer,
+                COMPARE_IO_SIZE as DWORD,
+                bytes_completed_ptr,
+                null_mut()
+            )
+        };
+
+        // Move data from virtually allocated read buffer into local buffer for comparison
+        read_buffer_ptr = read_buffer as *mut [u64; COMPARE_IO_SIZE];
+        read_buffer_local = unsafe {*read_buffer_ptr};
+
+        // Compare read buffer to pattern
+        received = read_buffer_local[0];
+        if received != pattern {
+            println!(   
+                "Data mismatch! Actual({:#018x}) vs Expected({:#018x})", received, pattern
+            );
+        }
+
+        pos += bytes_completed as u64;
+        if write == false || read == false {
+            println!("Thread {} encountered Error Code {}", id, win32::last_error());
+            break;
+        }
+
+        // Shift pattern and modify write buffer
+        pattern = bit_shift(pattern, 1);    // pass iterations as 2nd param to increase shift by 8 bits after each write
+        pattern_data = vec![pattern; COMPARE_IO_SIZE];
+        buf_local.copy_from_slice(&pattern_data);
+        
+        iterations += 1;
+    }
+    unsafe {
+        // Clean up resources
+        VirtualFree(read_buffer, 0, MEM_RELEASE);
+        VirtualFree(write_buffer, 0, MEM_RELEASE);
+        Foundation::CloseHandle(handle);
+    }
+    sender.send(format!("finished|{}", id)).unwrap();
 }
 
 
@@ -304,13 +450,13 @@ fn calculate_disk_info(disk_number: u8) -> (u64, u64, u64) {
     let sectors = disk_geometry.sectors();
     let size = disk_geometry.size();
     let sector_size = size / sectors;
-    let io_size = calculate_io_size(sector_size, MEGABYTE);
+    let io_size = calculate_nearest_multiple(sector_size, MEGABYTE);
     return (size, io_size, sector_size);
 }
 
 
 // Calculate and return nearest number to "base" that is a multiple of "multiple"
-fn calculate_io_size(multiple: u64, base: u64) -> u64 {
+fn calculate_nearest_multiple(multiple: u64, base: u64) -> u64 {
     let remainder = base % multiple;
     if remainder == 0 {
         return base.into();
@@ -322,6 +468,12 @@ fn calculate_io_size(multiple: u64, base: u64) -> u64 {
 // Format drive number for Win32 API
 fn format_drive_num(drive_num: u8) -> String {
     return format!("\\\\.\\PhysicalDrive{}", drive_num);
+}
+
+fn bit_shift(data: u64, iterations: u64) -> u64 {
+    let rotation = iterations % 16;        // Reset after each digit has been shifted once
+    let bit_count = rotation * 4;
+    data.rotate_right(bit_count.try_into().unwrap())
 }
 
 fn parse_hex(src: &str) -> Result<u64, ParseIntError> {
