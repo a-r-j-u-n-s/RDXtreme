@@ -1,5 +1,5 @@
 # Storage Device I/O Testing Tool
-_A multithreaded I/O testing tool designed for physical storage devices
+_A multithreaded I/O testing tool designed for physical storage devices_
 
 ## _About_
 This CLI allows you to run multithreaded read/write operations on physical storage devices. Users can specify the number of threads, I/O limits, and specific data patterns to write for testing purposes.
