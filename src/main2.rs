@@ -3,7 +3,7 @@ use windows::{core::PCWSTR, Win32::{Storage::FileSystem, Foundation, System::{Io
 use sysinfo::SystemExt;
 use powershell_script;
 use clap::Arg;
-use std::{time::Instant, mem::{size_of, drop}, ptr::{null_mut, null}, process::exit, thread, string::String, sync::mpsc::{channel, Sender, Receiver}};
+use std::{time::Instant, mem::{size_of, drop}, ptr::{null_mut, null, slice_from_raw_parts_mut}, process::exit, thread, string::String, sync::mpsc::{channel, Sender, Receiver}};
 use winapi::{shared::minwindef::{DWORD, LPVOID}, um::{fileapi::OPEN_EXISTING, winbase::FILE_FLAG_NO_BUFFERING, winnt::{FILE_SHARE_READ, FILE_SHARE_WRITE, GENERIC_WRITE, GENERIC_READ, MEM_COMMIT, MEM_RESERVE, MEM_RELEASE, PAGE_EXECUTE_READWRITE}, memoryapi::{VirtualAlloc, VirtualFree}}};
 use affinity::*;
 use std::num::ParseIntError;
@@ -87,8 +87,8 @@ fn main() {
         threads = args.value_of("threads").unwrap().parse().expect("Thread count must be a positive integer");
     }
     if args.is_present("pattern") {
-        pattern_str = args.value_of("pattern").unwrap().parse().expect("Pattern must be a valid string");
         compare_pattern = true;
+        pattern_str = args.value_of("pattern").unwrap().parse().expect("Pattern must be a valid string");
     }
     if args.is_present("io") {
         let io: u64 = args.value_of("io").unwrap().parse().expect("IO size must be a valid string");
@@ -136,10 +136,10 @@ fn main() {
     let (size, io_size, sector_size) = calculate_disk_info(disk_number, io_size);
     let mut limit = size;
     if args.is_present("limit (GB)") {
-        limit = args.value_of("limit (GB)").unwrap().parse().expect("I/O MB limit must be a valid integer");
+        limit = args.value_of("limit (GB)").unwrap().parse().expect("I/O GB limit must be a valid integer");
         limit *= GIGABYTE;
     } else if args.is_present("limit (MB)") {
-        limit = args.value_of("limit (MB)").unwrap().parse().expect("I/O GB limit must be a valid integer");
+        limit = args.value_of("limit (MB)").unwrap().parse().expect("I/O MB limit must be a valid integer");
         limit *= MEGABYTE;
     }
     
@@ -240,7 +240,7 @@ fn open_handle(path: &str, handle_type: char) -> Result<Foundation::HANDLE, Stri
 }
 
 // Conduct threaded IO operation (read/write)
-fn thread_io(sender: std::sync::mpsc::Sender<String>, disk_number: u8, num_threads: u64, id: u64, io_size: u64, limit: u64, io_type: char, _pattern: u64) {
+fn thread_io(sender: std::sync::mpsc::Sender<String>, disk_number: u8, num_threads: u64, id: u64, io_size: u64, limit: u64, io_type: char, pattern: u64) {
     let full_io_size: u64 = limit / num_threads;
     let path: String = format_drive_num(disk_number);
     let handle: Foundation::HANDLE = open_handle(&path, io_type).unwrap();
@@ -255,7 +255,7 @@ fn thread_io(sender: std::sync::mpsc::Sender<String>, disk_number: u8, num_threa
     offset = calculate_nearest_multiple(PAGE_SIZE, offset);
 
     let mut initialization_offset = 0;
-    if io_type == 'w' && id == 1 {   // Add 1 MB offset for the first thread to avoid uninitializing drive
+    if io_type == 'w' {
         initialization_offset += MEGABYTE;
     }
 
@@ -283,7 +283,6 @@ fn thread_io(sender: std::sync::mpsc::Sender<String>, disk_number: u8, num_threa
     let bytes_completed_ptr: *mut u32 = &mut bytes_completed;
     let mut pos: u64 = offset;
     let last_pos: u64 = full_io_size * id - io_size;
-    println!("Thread {} first pos = {}\nlast pos = {}", id, pos, last_pos);
 
     if io_type == 'w' {
         let now = Instant::now();
@@ -337,7 +336,8 @@ fn thread_io(sender: std::sync::mpsc::Sender<String>, disk_number: u8, num_threa
 
 
 // Multithreaded write/compare data patterns
-fn thread_data_pattern_io(sender: std::sync::mpsc::Sender<String>, num_threads: u64, id: u64, disk_number: u8, mut original_pattern: u64, size: u64, _sector_size: u64, io_size: u64) {
+// 1*[>W 64*[>r,c,w~]]
+fn thread_data_pattern_io(sender: std::sync::mpsc::Sender<String>, num_threads: u64, id: u64, disk_number: u8, original_pattern: u64, size: u64, sector_size: u64, io_size: u64) {
     let mut pattern = original_pattern;     // For data comparisons
     let full_io_size = size / num_threads;
     let path = format_drive_num(disk_number);
@@ -352,15 +352,10 @@ fn thread_data_pattern_io(sender: std::sync::mpsc::Sender<String>, num_threads: 
     // Set up data pattern
     let mut pattern_data: Vec<u64> = vec![pattern; COMPARE_IO_SIZE];
 
-    let mut initialization_offset = 0;
-    if id == 1 {   // Add 1 MB offset for the first thread to avoid uninitializing drive
-        initialization_offset += MEGABYTE;
-    }
-
     let mut _pointer = unsafe {
         FileSystem::SetFilePointerEx(
             handle,
-            (offset + initialization_offset) as i64,
+            (offset + MEGABYTE) as i64,
             null_mut(),
             FileSystem::FILE_BEGIN
         )
@@ -376,11 +371,21 @@ fn thread_data_pattern_io(sender: std::sync::mpsc::Sender<String>, num_threads: 
         )
     };
 
-    // Dumb but effective (for now) method to move pattern into sector-aligned buffer
-    let buf: *mut [u64; COMPARE_IO_SIZE] = write_buffer as *mut [u64; COMPARE_IO_SIZE];
-    let mut buf_local: [u64; COMPARE_IO_SIZE] = unsafe{*buf};
-    buf_local.copy_from_slice(&pattern_data);       // Copy pattern to local write buffer
+    // Move pattern into sector-aligned buffer
+    let mut buf = unsafe { std::slice::from_raw_parts_mut(write_buffer, COMPARE_IO_SIZE) } as *mut [u64; COMPARE_IO_SIZE];
+    // let buf: *mut [u64; COMPARE_IO_SIZE] = write_buffer as *mut [u64; COMPARE_IO_SIZE];
+    let mut buf_local: &mut [u64; COMPARE_IO_SIZE] = unsafe { &mut *buf };
+    // let mut buf_local: [u64; COMPARE_IO_SIZE] = unsafe{*buf};
+    // buf_local.copy_from_slice(&pattern_data);       // Copy pattern to local write buffer
     let write_buffer_ptr: LPVOID = &mut buf_local as *mut _ as LPVOID;
+    println!("Data {}", buf_local[0]);
+
+    /*
+    slice_from_raw_parts_mut() -- get the slice
+    cast the mut c void *mut u8 *** get the pointer cast
+    transmute
+    encapsulate win32 buffer into struct that wraps pointers
+    */
 
     let read_buffer: LPVOID = unsafe {
         VirtualAlloc(
@@ -394,7 +399,7 @@ fn thread_data_pattern_io(sender: std::sync::mpsc::Sender<String>, num_threads: 
     // I/O logistics
     let mut bytes_completed: u32 = 0;
     let bytes_completed_ptr: *mut u32 = &mut bytes_completed;
-    let mut pos: u64 = offset;
+    let mut pos: u64 = 0;
     let last_pos = full_io_size * id - io_size;
 
     let mut received: u64;
@@ -403,7 +408,7 @@ fn thread_data_pattern_io(sender: std::sync::mpsc::Sender<String>, num_threads: 
     let mut read_buffer_ptr: *mut [u64; COMPARE_IO_SIZE];
     let mut read_buffer_local: [u64; COMPARE_IO_SIZE];
 
-    // Full write
+    // Write data pattern to drive until given limit
     while pos <= last_pos as u64 {
 
         // Write to drive
@@ -420,89 +425,91 @@ fn thread_data_pattern_io(sender: std::sync::mpsc::Sender<String>, num_threads: 
         pos += bytes_completed as u64;
 
         if write == false {
-            println!("Thread {} encountered Error Code {}", id, win32::last_error());
+            println!("Thread {} encountered Error Code {} during write", id, win32::last_error());
             break;
         }
-    }
-    let mut iterations = 0;
-
-    while iterations < 64 {
 
         // Shift pattern and modify write buffer
-        original_pattern = pattern;
-        pattern = bit_shift(pattern, 1);    // pass iterations as 2nd param to increase shift by 8 bits after each write
-        pattern_data = vec![pattern; COMPARE_IO_SIZE];
-        buf_local.copy_from_slice(&pattern_data);
+        // pattern = bit_shift(pattern, 1);    // pass iterations as 2nd param to increase shift by 8 bits after each write
+        // pattern_data = vec![pattern; COMPARE_IO_SIZE];
+        // buf_local.copy_from_slice(&pattern_data);
+    }
 
-        // Reset position and move pointer back to initial offset to conduct read
-        pos = offset + initialization_offset;
-        _pointer = unsafe {
-            FileSystem::SetFilePointerEx(
+    // Reset position and move pointer back to initial offset to conduct read
+    pos = 0;
+    _pointer = unsafe {
+        FileSystem::SetFilePointerEx(
+            handle,
+            (offset + MEGABYTE) as i64,
+            null_mut(),
+            FileSystem::FILE_BEGIN
+        )
+    };
+    // pattern = original_pattern;
+
+    // Shift pattern and modify write buffer
+    pattern = bit_shift(pattern, 1);    // pass iterations as 2nd param to increase shift by 8 bits after each write
+    pattern_data = vec![pattern; COMPARE_IO_SIZE];
+    // buf_local.copy_from_slice(&pattern_data);
+
+    // read/compare/write shift
+    while pos <= last_pos {
+        let read = unsafe {
+            FileSystem::ReadFile(
                 handle,
-                (offset + MEGABYTE) as i64,
-                null_mut(),
-                FileSystem::FILE_BEGIN
+                read_buffer,
+                COMPARE_IO_SIZE as DWORD,
+                bytes_completed_ptr,
+                null_mut()
             )
         };
 
-        // Full read/compare
-        while pos <= last_pos {
-            let read = unsafe {
-                FileSystem::ReadFile(
-                    handle,
-                    read_buffer,
-                    COMPARE_IO_SIZE as DWORD,
-                    bytes_completed_ptr,
-                    null_mut()
-                )
-            };
+        // Move data from virtually allocated read buffer into local buffer for comparison
+        read_buffer_ptr = read_buffer as *mut [u64; COMPARE_IO_SIZE];
+        read_buffer_local = unsafe {*read_buffer_ptr};
 
-            // Move data from virtually allocated read buffer into local buffer for comparison
-            read_buffer_ptr = read_buffer as *mut [u64; COMPARE_IO_SIZE];
-            read_buffer_local = unsafe {*read_buffer_ptr};
-
-            // Compare read buffer to pattern
-            received = read_buffer_local[0];
-            if received != original_pattern {
-                println!(   
-                    "Data mismatch! Actual({:#018x}) vs Expected({:#018x})", received, original_pattern
-                );
-            }
-            pos += bytes_completed as u64;
-            if read == false {
-                println!("Thread {} encountered Error Code {}", id, win32::last_error());
-                break;
-            }
-
-            // Move pointer back to conduct read
-            _pointer = unsafe {
-                FileSystem::SetFilePointerEx(
-                    handle,
-                    (bytes_completed as i64 * -1) as i64,
-                    null_mut(),
-                    FileSystem::FILE_CURRENT
-                )
-            };
-
-            let write = unsafe {
-                FileSystem::WriteFile(
-                    handle,
-                    write_buffer_ptr,
-                    COMPARE_IO_SIZE as DWORD,
-                    bytes_completed_ptr,
-                    null_mut()
-                )
-            };
-
-            if write == false {
-                println!("Thread {} encountered Error Code {}", id, win32::last_error());
-                break;
-            }
-            // pattern = bit_shift(pattern, 1);
-
+        // Compare read buffer to pattern
+        received = read_buffer_local[0];
+        if received != pattern {
+            println!(   
+                "Data mismatch! Actual({:#018x}) vs Expected({:#018x})", received, pattern
+            );
         }
-        iterations += 1;
+
+        pos += bytes_completed as u64;
+        if read == false {
+            println!("Thread {} encountered Error Code {} during read", id, win32::last_error());
+            break;
+        }
+
+        // Move pointer back to conduct write
+        _pointer = unsafe {
+            FileSystem::SetFilePointerEx(
+                handle,
+                (bytes_completed as i64 * -1) as i64,
+                null_mut(),
+                FileSystem::FILE_CURRENT
+            )
+        };
+
+        // Write to drive
+        let write = unsafe {
+            FileSystem::WriteFile(
+                handle,
+                write_buffer_ptr,
+                COMPARE_IO_SIZE as DWORD,
+                bytes_completed_ptr,
+                null_mut()
+            )
+        };
+
+        if write == false {
+            println!("Thread {} encountered Error Code {} during write", id, win32::last_error());
+            break;
+        }
+
     }
+
     unsafe {
         // Clean up resources
         VirtualFree(read_buffer, 0, MEM_RELEASE);
@@ -611,3 +618,65 @@ fn id_controller(h_device: Foundation::HANDLE) {
     }
 
 }
+
+
+
+
+// Write/read combo
+    // while pos <= last_pos {
+
+    //     // Write to drive
+    //     let write = unsafe {
+    //         FileSystem::WriteFile(
+    //             handle,
+    //             write_buffer_ptr,
+    //             COMPARE_IO_SIZE as DWORD,
+    //             bytes_completed_ptr,
+    //             null_mut()
+    //         )
+    //     };
+
+    //     // Move pointer back to conduct read
+    //     _pointer = unsafe {
+    //         FileSystem::SetFilePointerEx(
+    //             handle,
+    //             (bytes_completed as i64 * -1) as i64,
+    //             null_mut(),
+    //             FileSystem::FILE_CURRENT
+    //         )
+    //     };
+        
+    //     // Read same segment
+    //     let read = unsafe {
+    //         FileSystem::ReadFile(
+    //             handle,
+    //             read_buffer,
+    //             COMPARE_IO_SIZE as DWORD,
+    //             bytes_completed_ptr,
+    //             null_mut()
+    //         )
+    //     };
+
+    //     // Move data from virtually allocated read buffer into local buffer for comparison
+    //     read_buffer_ptr = read_buffer as *mut [u64; COMPARE_IO_SIZE];
+    //     read_buffer_local = unsafe {*read_buffer_ptr};
+
+    //     // Compare read buffer to pattern
+    //     received = read_buffer_local[0];
+    //     if received != pattern {
+    //         println!(   
+    //             "Data mismatch! Actual({:#018x}) vs Expected({:#018x})", received, pattern
+    //         );
+    //     }
+
+    //     pos += bytes_completed as u64;
+    //     if write == false || read == false {
+    //         println!("Thread {} encountered Error Code {}", id, win32::last_error());
+    //         break;
+    //     }
+
+    //     // Shift pattern and modify write buffer
+    //     pattern = bit_shift(pattern, 1);    // pass iterations as 2nd param to increase shift by 8 bits after each write
+    //     pattern_data = vec![pattern; COMPARE_IO_SIZE];
+    //     buf_local.copy_from_slice(&pattern_data);
+    // }    
