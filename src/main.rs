@@ -282,8 +282,7 @@ fn thread_io(sender: std::sync::mpsc::Sender<String>, disk_number: u8, num_threa
     let mut bytes_completed: u32 = 0;
     let bytes_completed_ptr: *mut u32 = &mut bytes_completed;
     let mut pos: u64 = offset;
-    let last_pos: u64 = full_io_size * id - io_size;
-    println!("Thread {} first pos = {}\nlast pos = {}", id, pos, last_pos);
+    let last_pos: u64 = full_io_size * id - io_size - initialization_offset;
 
     if io_type == 'w' {
         let now = Instant::now();
@@ -395,7 +394,7 @@ fn thread_data_pattern_io(sender: std::sync::mpsc::Sender<String>, num_threads: 
     let mut bytes_completed: u32 = 0;
     let bytes_completed_ptr: *mut u32 = &mut bytes_completed;
     let mut pos: u64 = offset;
-    let last_pos = full_io_size * id - io_size;
+    let last_pos: u64 = full_io_size * id - io_size - initialization_offset;
 
     let mut received: u64;
 
@@ -427,19 +426,18 @@ fn thread_data_pattern_io(sender: std::sync::mpsc::Sender<String>, num_threads: 
     let mut iterations = 0;
 
     while iterations < 64 {
-
         // Shift pattern and modify write buffer
         original_pattern = pattern;
-        pattern = bit_shift(pattern, 1);    // pass iterations as 2nd param to increase shift by 8 bits after each write
+        pattern = bit_shift(pattern, 1);
         pattern_data = vec![pattern; COMPARE_IO_SIZE];
         buf_local.copy_from_slice(&pattern_data);
 
         // Reset position and move pointer back to initial offset to conduct read
-        pos = offset + initialization_offset;
+        pos = offset;
         _pointer = unsafe {
             FileSystem::SetFilePointerEx(
                 handle,
-                (offset + MEGABYTE) as i64,
+                (offset + initialization_offset) as i64,
                 null_mut(),
                 FileSystem::FILE_BEGIN
             )
@@ -465,9 +463,10 @@ fn thread_data_pattern_io(sender: std::sync::mpsc::Sender<String>, num_threads: 
             received = read_buffer_local[0];
             if received != original_pattern {
                 println!(   
-                    "Data mismatch! Actual({:#018x}) vs Expected({:#018x})", received, original_pattern
+                    "Data mismatch at thread {}! Actual({:#018x}) vs Expected({:#018x})", id, received, original_pattern
                 );
             }
+
             pos += bytes_completed as u64;
             if read == false {
                 println!("Thread {} encountered Error Code {}", id, win32::last_error());
@@ -498,8 +497,6 @@ fn thread_data_pattern_io(sender: std::sync::mpsc::Sender<String>, num_threads: 
                 println!("Thread {} encountered Error Code {}", id, win32::last_error());
                 break;
             }
-            // pattern = bit_shift(pattern, 1);
-
         }
         iterations += 1;
     }
