@@ -3,7 +3,7 @@ use windows::{core::PCWSTR, Win32::{Storage::FileSystem, Foundation, System::{Io
 use sysinfo::SystemExt;
 use powershell_script;
 use clap::Arg;
-use std::{time::Instant, mem::{size_of, drop}, ptr::{null_mut, null}, process::exit, thread, string::String, sync::mpsc::{channel, Sender, Receiver}};
+use std::{time::Instant, mem::{size_of, drop}, ptr::{null_mut, null, slice_from_raw_parts_mut}, process::exit, thread, string::String, sync::mpsc::{channel, Sender, Receiver}};
 use winapi::{shared::minwindef::{DWORD, LPVOID}, um::{fileapi::OPEN_EXISTING, winbase::FILE_FLAG_NO_BUFFERING, winnt::{FILE_SHARE_READ, FILE_SHARE_WRITE, GENERIC_WRITE, GENERIC_READ, MEM_COMMIT, MEM_RESERVE, MEM_RELEASE, PAGE_EXECUTE_READWRITE}, memoryapi::{VirtualAlloc, VirtualFree}}};
 use affinity::*;
 use std::num::ParseIntError;
@@ -14,7 +14,7 @@ use std::num::ParseIntError;
 const MEGABYTE: u64 = 1048576;
 const GIGABYTE: u64 = 1073741824;
 const PAGE_SIZE: u64 = 4096;
-const COMPARE_IO_SIZE: usize = MEGABYTE as usize;        // IO size to use specifically for data comparisons
+const COMPARE_IO_SIZE: usize = 258048/2;        // IO size to use specifically for data comparisons
 
 const NVME_MAX_LOG_SIZE: u64 = 0x1000;
 
@@ -63,9 +63,6 @@ fn main() {
             .long("io")
             .takes_value(true)
             .help("IO size (in MB)"))
-        .arg(Arg::new("use-groups")
-            .long("use-groups")
-            .takes_value(false))
         .arg(Arg::new("controller")
             .short('c')
             .long("controller")
@@ -85,17 +82,13 @@ fn main() {
     let disk_number: u8;
     let io_size: u64;
     let mut threads: u64 = 1;
-    let mut multiple_groups: bool = false;
     let io_type: char;      // Identifier for opening handle and conducting IO
     if args.is_present("threads") {
         threads = args.value_of("threads").unwrap().parse().expect("Thread count must be a positive integer");
     }
-    if args.is_present("use-groups") {
-        multiple_groups = true;
-    }
     if args.is_present("pattern") {
-        pattern_str = args.value_of("pattern").unwrap().parse().expect("Pattern must be a valid string");
         compare_pattern = true;
+        pattern_str = args.value_of("pattern").unwrap().parse().expect("Pattern must be a valid string");
     }
     if args.is_present("io") {
         let io: u64 = args.value_of("io").unwrap().parse().expect("IO size must be a valid string");
@@ -143,10 +136,10 @@ fn main() {
     let (size, io_size, sector_size) = calculate_disk_info(disk_number, io_size);
     let mut limit = size;
     if args.is_present("limit (GB)") {
-        limit = args.value_of("limit (GB)").unwrap().parse().expect("I/O MB limit must be a valid integer");
+        limit = args.value_of("limit (GB)").unwrap().parse().expect("I/O GB limit must be a valid integer");
         limit *= GIGABYTE;
     } else if args.is_present("limit (MB)") {
-        limit = args.value_of("limit (MB)").unwrap().parse().expect("I/O GB limit must be a valid integer");
+        limit = args.value_of("limit (MB)").unwrap().parse().expect("I/O MB limit must be a valid integer");
         limit *= MEGABYTE;
     }
     
@@ -154,17 +147,12 @@ fn main() {
     let num_cores = get_core_num();     // CPU cores in the current processor group
     pattern = parse_hex(&pattern_str).unwrap();
     while threads != 0 {
-        let sen_clone: Sender<String> = sender.clone();
+        let sen_clone = sender.clone();
         thread::spawn(move || {
-            let processor_groups: Vec<GROUP_AFFINITY> = get_proc_groups().unwrap();
-            if multiple_groups {
-                set_thread_group(processor_groups[threads as usize / num_cores]);   // Use multiple processor groups
-                // println!("Thread {} at Group {}, Core {}", threads, processor_groups[threads as usize / num_cores].group, get_thread_affinity().unwrap()[0]);
-            } else {
-                set_thread_group(processor_groups[0]);      // Use first group with round robin approach if threads exceed core count
-            }
-            let affinity: Vec<usize> = vec![(threads % num_cores as u64) as usize; 1];      // Wrap threads around 
-            let _ = set_thread_affinity(affinity);      // Pin thread to single CPU core
+            // Pin thread to single CPU core in first processor group
+            let affinity: Vec<usize> = vec![(threads % num_cores as u64) as usize; 1];
+            let _ = set_thread_affinity(affinity);
+            // println!("Thread {} at Core: {}", threads, get_thread_affinity().unwrap()[0]);  // For debugging purposes 
             if compare_pattern {
                 thread_data_pattern_io(sen_clone, num_threads, threads.clone(), disk_number, pattern, limit, sector_size, io_size);
             } else {
@@ -214,7 +202,6 @@ fn open_handle(path: &str, handle_type: char) -> Result<Foundation::HANDLE, Stri
     let handle_template = Foundation::HANDLE(0);    // Generic hTemplate needed for CreateFileW
     let path_ptr: PCWSTR = PCWSTR(path.as_ptr() as *const u16);
     let handle: Foundation::HANDLE;
-    // Different parameters needed for write/read handles
     if handle_type == 'w' {
         handle = unsafe {
             FileSystem::CreateFileW(
@@ -262,13 +249,13 @@ fn thread_io(sender: std::sync::mpsc::Sender<String>, disk_number: u8, num_threa
     let mut offset = (id - 1) * full_io_size;
 
     // Set up data pattern
-    let pattern_data: Vec<u64> = vec![pattern; COMPARE_IO_SIZE / std::mem::size_of::<u64>()];
+    // let pattern_data: Vec<u64> = vec![pattern; COMPARE_IO_SIZE];
 
     // Reset offset if not an even multiple of page size (4k bytes)
     offset = calculate_nearest_multiple(PAGE_SIZE, offset);
 
     let mut initialization_offset = 0;
-    if io_type == 'w' && id == 1 {   // Add 1 MB offset for the first thread to avoid uninitializing drive
+    if io_type == 'w' {
         initialization_offset += MEGABYTE;
     }
 
@@ -290,21 +277,12 @@ fn thread_io(sender: std::sync::mpsc::Sender<String>, disk_number: u8, num_threa
             PAGE_EXECUTE_READWRITE
         )
     };
-
-    // Move pattern into sector-aligned buffer
-    let buf_ptr_raw: *mut [u64] = std::ptr::slice_from_raw_parts_mut(buffer, COMPARE_IO_SIZE / std::mem::size_of::<u64>()) as *mut [u64];
-    let part: &mut [u64];
-    unsafe {
-        let buf_ptr: *mut [u64] = buf_ptr_raw as *mut [u64];
-        part = &mut *buf_ptr;
-        part.copy_from_slice(&pattern_data);
-    }
     
 
     let mut bytes_completed: u32 = 0;
     let bytes_completed_ptr: *mut u32 = &mut bytes_completed;
     let mut pos: u64 = offset;
-    let last_pos: u64 = full_io_size * id - io_size - initialization_offset;
+    let last_pos: u64 = full_io_size * id - io_size;
 
     if io_type == 'w' {
         let now = Instant::now();
@@ -358,7 +336,8 @@ fn thread_io(sender: std::sync::mpsc::Sender<String>, disk_number: u8, num_threa
 
 
 // Multithreaded write/compare data patterns
-fn thread_data_pattern_io(sender: std::sync::mpsc::Sender<String>, num_threads: u64, id: u64, disk_number: u8, mut original_pattern: u64, size: u64, _sector_size: u64, io_size: u64) {
+// 1*[>W 64*[>r,c,w~]]
+fn thread_data_pattern_io(sender: std::sync::mpsc::Sender<String>, num_threads: u64, id: u64, disk_number: u8, original_pattern: u64, size: u64, sector_size: u64, io_size: u64) {
     let mut pattern = original_pattern;     // For data comparisons
     let full_io_size = size / num_threads;
     let path = format_drive_num(disk_number);
@@ -371,17 +350,12 @@ fn thread_data_pattern_io(sender: std::sync::mpsc::Sender<String>, num_threads: 
     offset = calculate_nearest_multiple(PAGE_SIZE, offset);
 
     // Set up data pattern
-    let mut pattern_data: Vec<u64> = vec![pattern; COMPARE_IO_SIZE / std::mem::size_of::<u64>()];
-
-    let mut initialization_offset = 0;
-    if id == 1 {   // Add 1 MB offset for the first thread to avoid uninitializing drive
-        initialization_offset += MEGABYTE;
-    }
+    let mut pattern_data: Vec<u64> = vec![pattern; COMPARE_IO_SIZE];
 
     let mut _pointer = unsafe {
         FileSystem::SetFilePointerEx(
             handle,
-            (offset + initialization_offset) as i64,
+            (offset + MEGABYTE) as i64,
             null_mut(),
             FileSystem::FILE_BEGIN
         )
@@ -398,14 +372,21 @@ fn thread_data_pattern_io(sender: std::sync::mpsc::Sender<String>, num_threads: 
     };
 
     // Move pattern into sector-aligned buffer
-    let buf_ptr_raw: *mut [u64] = std::ptr::slice_from_raw_parts_mut(write_buffer, COMPARE_IO_SIZE / std::mem::size_of::<u64>()) as *mut [u64];
-    let part: &mut [u64];
-    unsafe {
-        let buf_ptr: *mut [u64] = buf_ptr_raw as *mut [u64];
-        part = &mut *buf_ptr;
-        part.copy_from_slice(&pattern_data);
-    }
-    
+    let mut buf = unsafe { std::slice::from_raw_parts_mut(write_buffer, COMPARE_IO_SIZE) } as *mut [u64; COMPARE_IO_SIZE];
+    // let buf: *mut [u64; COMPARE_IO_SIZE] = write_buffer as *mut [u64; COMPARE_IO_SIZE];
+    let mut buf_local: &mut [u64; COMPARE_IO_SIZE] = unsafe { &mut *buf };
+    // let mut buf_local: [u64; COMPARE_IO_SIZE] = unsafe{*buf};
+    // buf_local.copy_from_slice(&pattern_data);       // Copy pattern to local write buffer
+    let write_buffer_ptr: LPVOID = &mut buf_local as *mut _ as LPVOID;
+    println!("Data {}", buf_local[0]);
+
+    /*
+    slice_from_raw_parts_mut() -- get the slice
+    cast the mut c void *mut u8 *** get the pointer cast
+    transmute
+    encapsulate win32 buffer into struct that wraps pointers
+    */
+
     let read_buffer: LPVOID = unsafe {
         VirtualAlloc(
             null_mut(),
@@ -418,8 +399,8 @@ fn thread_data_pattern_io(sender: std::sync::mpsc::Sender<String>, num_threads: 
     // I/O logistics
     let mut bytes_completed: u32 = 0;
     let bytes_completed_ptr: *mut u32 = &mut bytes_completed;
-    let mut pos: u64 = offset;
-    let last_pos: u64 = full_io_size * id - io_size - initialization_offset;
+    let mut pos: u64 = 0;
+    let last_pos = full_io_size * id - io_size;
 
     let mut received: u64;
 
@@ -427,14 +408,14 @@ fn thread_data_pattern_io(sender: std::sync::mpsc::Sender<String>, num_threads: 
     let mut read_buffer_ptr: *mut [u64; COMPARE_IO_SIZE];
     let mut read_buffer_local: [u64; COMPARE_IO_SIZE];
 
-    // Full write
+    // Write data pattern to drive until given limit
     while pos <= last_pos as u64 {
 
         // Write to drive
         let write = unsafe {
             FileSystem::WriteFile(
                 handle,
-                write_buffer,
+                write_buffer_ptr,
                 COMPARE_IO_SIZE as DWORD,
                 bytes_completed_ptr,
                 null_mut()
@@ -444,88 +425,91 @@ fn thread_data_pattern_io(sender: std::sync::mpsc::Sender<String>, num_threads: 
         pos += bytes_completed as u64;
 
         if write == false {
-            println!("Thread {} encountered Error Code {}", id, win32::last_error());
+            println!("Thread {} encountered Error Code {} during write", id, win32::last_error());
             break;
         }
-    }
-    let mut iterations = 0;
 
-    while iterations < 64 {
         // Shift pattern and modify write buffer
-        original_pattern = pattern;
-        pattern = bit_shift(pattern, 1);
-        pattern_data = vec![pattern; COMPARE_IO_SIZE / std::mem::size_of::<u64>()];
-        part.copy_from_slice(&pattern_data);
+        // pattern = bit_shift(pattern, 1);    // pass iterations as 2nd param to increase shift by 8 bits after each write
+        // pattern_data = vec![pattern; COMPARE_IO_SIZE];
+        // buf_local.copy_from_slice(&pattern_data);
+    }
 
-        // Reset position and move pointer back to initial offset to conduct read
-        pos = offset;
-        _pointer = unsafe {
-            FileSystem::SetFilePointerEx(
+    // Reset position and move pointer back to initial offset to conduct read
+    pos = 0;
+    _pointer = unsafe {
+        FileSystem::SetFilePointerEx(
+            handle,
+            (offset + MEGABYTE) as i64,
+            null_mut(),
+            FileSystem::FILE_BEGIN
+        )
+    };
+    // pattern = original_pattern;
+
+    // Shift pattern and modify write buffer
+    pattern = bit_shift(pattern, 1);    // pass iterations as 2nd param to increase shift by 8 bits after each write
+    pattern_data = vec![pattern; COMPARE_IO_SIZE];
+    // buf_local.copy_from_slice(&pattern_data);
+
+    // read/compare/write shift
+    while pos <= last_pos {
+        let read = unsafe {
+            FileSystem::ReadFile(
                 handle,
-                (offset + initialization_offset) as i64,
-                null_mut(),
-                FileSystem::FILE_BEGIN
+                read_buffer,
+                COMPARE_IO_SIZE as DWORD,
+                bytes_completed_ptr,
+                null_mut()
             )
         };
 
-        // Full read/compare
-        while pos <= last_pos {
-            let read = unsafe {
-                FileSystem::ReadFile(
-                    handle,
-                    read_buffer,
-                    COMPARE_IO_SIZE as DWORD,
-                    bytes_completed_ptr,
-                    null_mut()
-                )
-            };
+        // Move data from virtually allocated read buffer into local buffer for comparison
+        read_buffer_ptr = read_buffer as *mut [u64; COMPARE_IO_SIZE];
+        read_buffer_local = unsafe {*read_buffer_ptr};
 
-            // Move data from virtually allocated read buffer into local buffer for comparison
-            read_buffer_ptr = read_buffer as *mut [u64; COMPARE_IO_SIZE];
-            read_buffer_local = unsafe {*read_buffer_ptr};
-
-            // Compare read buffer to pattern
-            received = read_buffer_local[0];
-            if received != original_pattern {
-                println!(   
-                    "Data mismatch at thread {}! Actual({:#018x}) vs Expected({:#018x})", id, received, original_pattern
-                );
-            }
-
-            pos += bytes_completed as u64;
-            if read == false {
-                println!("Thread {} encountered Error Code {}", id, win32::last_error());
-                break;
-            }
-
-            // Move pointer back to conduct read
-            _pointer = unsafe {
-                FileSystem::SetFilePointerEx(
-                    handle,
-                    (bytes_completed as i64 * -1) as i64,
-                    null_mut(),
-                    FileSystem::FILE_CURRENT
-                )
-            };
-
-            // Write shifted pattern to same LBA
-            let write = unsafe {
-                FileSystem::WriteFile(
-                    handle,
-                    write_buffer,
-                    COMPARE_IO_SIZE as DWORD,
-                    bytes_completed_ptr,
-                    null_mut()
-                )
-            };
-
-            if write == false {
-                println!("Thread {} encountered Error Code {}", id, win32::last_error());
-                break;
-            }
+        // Compare read buffer to pattern
+        received = read_buffer_local[0];
+        if received != pattern {
+            println!(   
+                "Data mismatch! Actual({:#018x}) vs Expected({:#018x})", received, pattern
+            );
         }
-        iterations += 1;
+
+        pos += bytes_completed as u64;
+        if read == false {
+            println!("Thread {} encountered Error Code {} during read", id, win32::last_error());
+            break;
+        }
+
+        // Move pointer back to conduct write
+        _pointer = unsafe {
+            FileSystem::SetFilePointerEx(
+                handle,
+                (bytes_completed as i64 * -1) as i64,
+                null_mut(),
+                FileSystem::FILE_CURRENT
+            )
+        };
+
+        // Write to drive
+        let write = unsafe {
+            FileSystem::WriteFile(
+                handle,
+                write_buffer_ptr,
+                COMPARE_IO_SIZE as DWORD,
+                bytes_completed_ptr,
+                null_mut()
+            )
+        };
+
+        if write == false {
+            println!("Thread {} encountered Error Code {} during write", id, win32::last_error());
+            break;
+        }
+
     }
+
     unsafe {
         // Clean up resources
         VirtualFree(read_buffer, 0, MEM_RELEASE);
@@ -574,138 +558,6 @@ fn bit_shift(data: u64, iterations: u64) -> u64 {
 
 fn parse_hex(src: &str) -> Result<u64, ParseIntError> {
     u64::from_str_radix(src, 16)
-}
-
-
-// Adapted from Andrew Adriance's Mempoke
-#[repr(C)]
-#[allow(non_camel_case_types)]
-#[allow(dead_code)]
-#[derive(Debug, Copy, Clone)]
-struct GROUP_AFFINITY {
-    mask: usize,
-    group: u16,
-    reserved: [u16; 3],
-}
-
-fn get_proc_groups() -> Option<Vec<GROUP_AFFINITY>> {
-    use std::mem;
-    use std::slice;
-
-    #[allow(non_upper_case_globals)]
-    const RelationProcessorCore: u32 = 0;
-
-    #[repr(C)]
-    #[allow(non_camel_case_types)]
-    #[allow(dead_code)]
-    struct PROCESSOR_RELATIONSHIP {
-        flags: u8,
-        efficiency_class: u8,
-        reserved: [u8; 20],
-        group_count: u16,
-        group_mask_tenative: [GROUP_AFFINITY; 1],
-    }
-
-    #[repr(C)]
-    #[allow(non_camel_case_types)]
-    #[allow(dead_code)]
-    struct SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX {
-        relationship: u32,
-        size: u32,
-        processor: PROCESSOR_RELATIONSHIP,
-    }
-
-    extern "system" {
-        fn GetLogicalProcessorInformationEx(
-            relationship: u32,
-            data: *mut u8,
-            length: &mut u32,
-        ) -> bool;
-    }
-
-    // First we need to determine how much space to reserve.
-
-    // The required size of the buffer, in bytes.
-    let mut needed_size = 0;
-
-    unsafe {
-        GetLogicalProcessorInformationEx(RelationProcessorCore, null_mut(), &mut needed_size);
-    }
-
-    // Could be 0, or some other bogus size.
-    if needed_size == 0 {
-        return None;
-    }
-
-    // Allocate memory where we will store the processor info.
-    let mut buffer: Vec<u8> = vec![0 as u8; needed_size as usize];
-
-    unsafe {
-        let result: bool = GetLogicalProcessorInformationEx(
-            RelationProcessorCore,
-            buffer.as_mut_ptr(),
-            &mut needed_size,
-        );
-
-        if result == false {
-            return None;
-        }
-    }
-
-    let mut affinity_list = Vec::<GROUP_AFFINITY>::new();
-    let mut group_list = Vec::<u16>::new();
-
-    let mut byte_offset: usize = 0;
-    while byte_offset < needed_size as usize {
-        unsafe {
-            // interpret this byte-array as SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX struct
-            let part_ptr_raw: *const u8 = buffer.as_ptr().offset(byte_offset as isize);
-            let part_ptr: *const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX =
-                mem::transmute::<*const u8, *const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(
-                    part_ptr_raw,
-                );
-            let part: &SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX = &*part_ptr;
-
-            // we are only interested in RelationProcessorCore information and hence
-            // we have requested only for this kind of data (so we should not see other types of data)
-            if part.relationship == RelationProcessorCore {
-                // the number of GROUP_AFFINITY structs in the array will be specified in the 'groupCount'
-                // we tenatively use the first element to get the pointer to it and reinterpret the
-                // entire slice with the groupCount
-                let groupmasks_slice: &[GROUP_AFFINITY] = slice::from_raw_parts(
-                    part.processor.group_mask_tenative.as_ptr(),
-                    part.processor.group_count as usize,
-                );
-
-                for affinity in groupmasks_slice {
-                    if !group_list.contains(&affinity.group) {
-                        affinity_list.push(*affinity);
-                        group_list.push(affinity.group);
-                    }
-                }
-            }
-
-            // set the pointer to the next part as indicated by the size of this part
-            byte_offset += part.size as usize;
-        }
-    }
-
-    Some(affinity_list)
-}
-
-fn set_thread_group(group: GROUP_AFFINITY) {
-    extern "system" {
-        fn GetCurrentThread() -> LPVOID;
-        fn SetThreadGroupAffinity(
-            thread_handle: LPVOID,
-            group_affinity: *mut GROUP_AFFINITY,
-            previous_affinity: *mut u8,
-        ) -> bool;
-    }
-
-    unsafe {
-        SetThreadGroupAffinity(GetCurrentThread(), &mut group.clone(), null_mut());
-    }
 }
 
 // TODO: Retrieve Identify Controller information 
@@ -766,3 +618,65 @@ fn id_controller(h_device: Foundation::HANDLE) {
     }
 
 }
+
+
+
+
+// Write/read combo
+    // while pos <= last_pos {
+
+    //     // Write to drive
+    //     let write = unsafe {
+    //         FileSystem::WriteFile(
+    //             handle,
+    //             write_buffer_ptr,
+    //             COMPARE_IO_SIZE as DWORD,
+    //             bytes_completed_ptr,
+    //             null_mut()
+    //         )
+    //     };
+
+    //     // Move pointer back to conduct read
+    //     _pointer = unsafe {
+    //         FileSystem::SetFilePointerEx(
+    //             handle,
+    //             (bytes_completed as i64 * -1) as i64,
+    //             null_mut(),
+    //             FileSystem::FILE_CURRENT
+    //         )
+    //     };
+        
+    //     // Read same segment
+    //     let read = unsafe {
+    //         FileSystem::ReadFile(
+    //             handle,
+    //             read_buffer,
+    //             COMPARE_IO_SIZE as DWORD,
+    //             bytes_completed_ptr,
+    //             null_mut()
+    //         )
+    //     };
+
+    //     // Move data from virtually allocated read buffer into local buffer for comparison
+    //     read_buffer_ptr = read_buffer as *mut [u64; COMPARE_IO_SIZE];
+    //     read_buffer_local = unsafe {*read_buffer_ptr};
+
+    //     // Compare read buffer to pattern
+    //     received = read_buffer_local[0];
+    //     if received != pattern {
+    //         println!(   
+    //             "Data mismatch! Actual({:#018x}) vs Expected({:#018x})", received, pattern
+    //         );
+    //     }
+
+    //     pos += bytes_completed as u64;
+    //     if write == false || read == false {
+    //         println!("Thread {} encountered Error Code {}", id, win32::last_error());
+    //         break;
+    //     }
+
+    //     // Shift pattern and modify write buffer
+    //     pattern = bit_shift(pattern, 1);    // pass iterations as 2nd param to increase shift by 8 bits after each write
+    //     pattern_data = vec![pattern; COMPARE_IO_SIZE];
+    //     buf_local.copy_from_slice(&pattern_data);
+    // }    
