@@ -14,7 +14,6 @@ use std::num::ParseIntError;
 const MEGABYTE: u64 = 1048576;
 const GIGABYTE: u64 = 1073741824;
 const PAGE_SIZE: u64 = 4096;
-const COMPARE_IO_SIZE: usize = MEGABYTE as usize;        // IO size to use specifically for data comparisons
 
 const NVME_MAX_LOG_SIZE: u64 = 0x1000;
 
@@ -59,10 +58,10 @@ fn main() {
             .takes_value(true)
             .help("Data pattern to write to drive"))
         .arg(Arg::new("io")
-            .short('i')
-            .long("io")
+            .short('b')
+            .long("buffer")
             .takes_value(true)
-            .help("IO size (in MB)"))
+            .help("buffer size (in MB)"))
         .arg(Arg::new("use-groups")
             .long("use-groups")
             .takes_value(false))
@@ -97,9 +96,9 @@ fn main() {
         pattern_str = args.value_of("pattern").unwrap().parse().expect("Pattern must be a valid string");
         compare_pattern = true;
     }
-    if args.is_present("io") {
-        let io: u64 = args.value_of("io").unwrap().parse().expect("IO size must be a valid string");
-        io_size = io * MEGABYTE;
+    if args.is_present("buffer") {
+        let buffer_size: u64 = args.value_of("buffer").unwrap().parse().expect("IO size must be a valid string");
+        io_size = buffer_size * MEGABYTE;
     } else {
         io_size = MEGABYTE;
     }
@@ -262,7 +261,7 @@ fn thread_io(sender: std::sync::mpsc::Sender<String>, disk_number: u8, num_threa
     let mut offset = (id - 1) * full_io_size;
 
     // Set up data pattern
-    let pattern_data: Vec<u64> = vec![pattern; COMPARE_IO_SIZE / std::mem::size_of::<u64>()];
+    let pattern_data: Vec<u64> = vec![pattern; io_size as usize / std::mem::size_of::<u64>()];
 
     // Reset offset if not an even multiple of page size (4k bytes)
     offset = calculate_nearest_multiple(PAGE_SIZE, offset);
@@ -290,15 +289,6 @@ fn thread_io(sender: std::sync::mpsc::Sender<String>, disk_number: u8, num_threa
             PAGE_EXECUTE_READWRITE
         )
     };
-
-    // Move pattern into sector-aligned buffer
-    let buf_ptr_raw: *mut [u64] = std::ptr::slice_from_raw_parts_mut(buffer, COMPARE_IO_SIZE / std::mem::size_of::<u64>()) as *mut [u64];
-    let part: &mut [u64];
-    unsafe {
-        let buf_ptr: *mut [u64] = buf_ptr_raw as *mut [u64];
-        part = &mut *buf_ptr;
-        part.copy_from_slice(&pattern_data);
-    }
     
 
     let mut bytes_completed: u32 = 0;
@@ -307,6 +297,14 @@ fn thread_io(sender: std::sync::mpsc::Sender<String>, disk_number: u8, num_threa
     let last_pos: u64 = full_io_size * id - io_size - initialization_offset;
 
     if io_type == 'w' {
+        // Set up references for write buffer and copy pattern data into buffer 
+        let write_buffer_ptr_raw: *mut [u64] = std::ptr::slice_from_raw_parts_mut(buffer, io_size as usize / std::mem::size_of::<u64>()) as *mut [u64];
+        let write_buf: &mut [u64];
+        unsafe {
+            let buf_ptr: *mut [u64] = write_buffer_ptr_raw as *mut [u64];
+            write_buf = &mut *buf_ptr;
+            write_buf.copy_from_slice(&pattern_data);
+        }
         let now = Instant::now();
         while pos <= last_pos {
             let write = unsafe {
@@ -371,7 +369,7 @@ fn thread_data_pattern_io(sender: std::sync::mpsc::Sender<String>, num_threads: 
     offset = calculate_nearest_multiple(PAGE_SIZE, offset);
 
     // Set up data pattern
-    let mut pattern_data: Vec<u64> = vec![pattern; COMPARE_IO_SIZE / std::mem::size_of::<u64>()];
+    let mut pattern_data: Vec<u64> = vec![pattern; io_size as usize / std::mem::size_of::<u64>()];
 
     let mut initialization_offset = 0;
     if id == 1 {   // Add 1 MB offset for the first thread to avoid uninitializing drive
@@ -391,25 +389,25 @@ fn thread_data_pattern_io(sender: std::sync::mpsc::Sender<String>, num_threads: 
     let write_buffer: LPVOID = unsafe {
         VirtualAlloc(
             null_mut(),
-            COMPARE_IO_SIZE,
+            io_size as usize,
             MEM_COMMIT | MEM_RESERVE,
             PAGE_EXECUTE_READWRITE
         )
     };
 
-    // Move pattern into sector-aligned buffer
-    let buf_ptr_raw: *mut [u64] = std::ptr::slice_from_raw_parts_mut(write_buffer, COMPARE_IO_SIZE / std::mem::size_of::<u64>()) as *mut [u64];
-    let part: &mut [u64];
+    // Set up references for write buffer and copy pattern data into buffer 
+    let write_buffer_ptr_raw: *mut [u64] = std::ptr::slice_from_raw_parts_mut(write_buffer, io_size as usize / std::mem::size_of::<u64>()) as *mut [u64];
+    let write_buf: &mut [u64];
     unsafe {
-        let buf_ptr: *mut [u64] = buf_ptr_raw as *mut [u64];
-        part = &mut *buf_ptr;
-        part.copy_from_slice(&pattern_data);
+        let buf_ptr: *mut [u64] = write_buffer_ptr_raw as *mut [u64];
+        write_buf = &mut *buf_ptr;
+        write_buf.copy_from_slice(&pattern_data);
     }
     
     let read_buffer: LPVOID = unsafe {
         VirtualAlloc(
             null_mut(),
-            COMPARE_IO_SIZE as usize,
+            io_size as usize,
             MEM_COMMIT | MEM_RESERVE,
             PAGE_EXECUTE_READWRITE
         )
@@ -423,9 +421,9 @@ fn thread_data_pattern_io(sender: std::sync::mpsc::Sender<String>, num_threads: 
 
     let mut received: u64;
 
-    // Raw pointer for read buffer
-    let mut read_buffer_ptr: *mut [u64; COMPARE_IO_SIZE];
-    let mut read_buffer_local: [u64; COMPARE_IO_SIZE];
+    // Set up raw pointer and reference for read buffer
+    let mut read_buffer_ptr_raw: *mut [u64];
+    let mut read_buf: &mut [u64];
 
     // Full write
     while pos <= last_pos as u64 {
@@ -435,7 +433,7 @@ fn thread_data_pattern_io(sender: std::sync::mpsc::Sender<String>, num_threads: 
             FileSystem::WriteFile(
                 handle,
                 write_buffer,
-                COMPARE_IO_SIZE as DWORD,
+                io_size as DWORD,
                 bytes_completed_ptr,
                 null_mut()
             )
@@ -454,8 +452,8 @@ fn thread_data_pattern_io(sender: std::sync::mpsc::Sender<String>, num_threads: 
         // Shift pattern and modify write buffer
         original_pattern = pattern;
         pattern = bit_shift(pattern, 1);
-        pattern_data = vec![pattern; COMPARE_IO_SIZE / std::mem::size_of::<u64>()];
-        part.copy_from_slice(&pattern_data);
+        pattern_data = vec![pattern; io_size as usize / std::mem::size_of::<u64>()];
+        write_buf.copy_from_slice(&pattern_data);
 
         // Reset position and move pointer back to initial offset to conduct read
         pos = offset;
@@ -474,18 +472,21 @@ fn thread_data_pattern_io(sender: std::sync::mpsc::Sender<String>, num_threads: 
                 FileSystem::ReadFile(
                     handle,
                     read_buffer,
-                    COMPARE_IO_SIZE as DWORD,
+                    io_size as DWORD,
                     bytes_completed_ptr,
                     null_mut()
                 )
             };
 
-            // Move data from virtually allocated read buffer into local buffer for comparison
-            read_buffer_ptr = read_buffer as *mut [u64; COMPARE_IO_SIZE];
-            read_buffer_local = unsafe {*read_buffer_ptr};
+            // Retrieve data from read buffer for comparison
+            read_buffer_ptr_raw = std::ptr::slice_from_raw_parts_mut(read_buffer, io_size as usize / std::mem::size_of::<u64>()) as *mut [u64];
+            unsafe {
+                let buf_ptr: *mut [u64] = read_buffer_ptr_raw as *mut [u64];
+                read_buf = &mut *buf_ptr;
+            }
 
             // Compare read buffer to pattern
-            received = read_buffer_local[0];
+            received = read_buf[0];
             if received != original_pattern {
                 println!(   
                     "Data mismatch at thread {}! Actual({:#018x}) vs Expected({:#018x})", id, received, original_pattern
@@ -513,7 +514,7 @@ fn thread_data_pattern_io(sender: std::sync::mpsc::Sender<String>, num_threads: 
                 FileSystem::WriteFile(
                     handle,
                     write_buffer,
-                    COMPARE_IO_SIZE as DWORD,
+                    io_size as DWORD,
                     bytes_completed_ptr,
                     null_mut()
                 )

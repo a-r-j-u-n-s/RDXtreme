@@ -27,7 +27,7 @@ Run `physical_disks.exe -a` in PowerShell to see a list of your machine's physic
 
 
 ```
-storagetiotool.exe -w/-r [disk #] -t [THREADS] -p [PATTERN] -g/-m [LIMIT] -i [SIZE]
+storagetiotool.exe -w/-r [disk #] -t [THREADS] -p [PATTERN] -g/-m [LIMIT] -b [SIZE]
 ```
 
 ### Flags
@@ -44,6 +44,6 @@ storagetiotool.exe -w/-r [disk #] -t [THREADS] -p [PATTERN] -g/-m [LIMIT] -i [SI
 
 `-p` : Data pattern to use for writes/comparisons
 
-`-i` : I/O size (in MB)
+`-b` : Buffer size (in MB)
 
 ## _Performance_
