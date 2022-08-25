@@ -64,5 +64,5 @@ DeviceId FriendlyName         SerialNumber                             MediaType
 ./storagetiotool.exe -w 0 -t 64 -p 0123456789abcdef -g 10 -b 1
 ```
 
-This set of commands will continuously write/read/compare/shift the pattern "0x0123456789abcdef" to the TOSHIBA storage device
+This set of commands will continuously write/read/compare/shift the pattern "0x0123456789abcdef" to the first 10 GB of the TOSHIBA storage device. The pattern will be written from a 1 MB pattern with 64 concurrent threads.
 
