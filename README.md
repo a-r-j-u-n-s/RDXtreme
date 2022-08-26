@@ -44,7 +44,7 @@ storagetiotool.exe -w/-r [disk #] -t [THREADS] -p [PATTERN] -g/-m [LIMIT] -b [SI
 
 `-p` : Data pattern to use for writes/comparisons
 
-`-b` : Buffer size (in MB)
+`-b` : Buffer/IO operation size (in multiples of 4 KB)
 
 ## _**Example Use Cases**_
 
@@ -61,8 +61,8 @@ DeviceId FriendlyName         SerialNumber                             MediaType
 `1*[>W 64*[>r,c,w~]]` is the supported data comparison pattern
 
 ```
-./storagetiotool.exe -w 0 -t 64 -p 0123456789abcdef -g 10 -b 1
+./storagetiotool.exe -w 0 -t 64 -p 0123456789abcdef -g 10 -b 4
 ```
 
-This set of commands will continuously write/read/compare/shift the pattern "0x0123456789abcdef" to the first 10 GB of the TOSHIBA storage device. The pattern will be written from a 1 MB pattern with 64 concurrent threads.
+This set of commands will continuously write/read/compare/shift the pattern "0x0123456789abcdef" to the first 10 GB of the TOSHIBA storage device. The pattern will be written from a 1 MB pattern with 64 concurrent threads. Each write/read will be 16 KB.
 

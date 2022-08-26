@@ -8,12 +8,13 @@ use winapi::{shared::minwindef::{DWORD, LPVOID}, um::{fileapi::OPEN_EXISTING, wi
 use affinity::*;
 use std::num::ParseIntError;
 
-// TODO: FIX COMPARE IO SIZE, MAKE IT HEAP ALLOCATED AND FUNCTION THE SAME WAY AS IT DOES FOR NORMAL IO
+// TODO: Use memcpy and comparison to compare rather than just first element
 
-// Sector aligned constants
+// Sector aligned buffer size constants
 const MEGABYTE: u64 = 1048576;
 const GIGABYTE: u64 = 1073741824;
 const PAGE_SIZE: u64 = 4096;
+const INITIALIZATION_OFFSET: u64 = 4096;
 
 const NVME_MAX_LOG_SIZE: u64 = 0x1000;
 
@@ -57,11 +58,11 @@ fn main() {
             .long("pattern")
             .takes_value(true)
             .help("Data pattern to write to drive"))
-        .arg(Arg::new("io")
+        .arg(Arg::new("buffer")
             .short('b')
             .long("buffer")
             .takes_value(true)
-            .help("buffer size (in MB)"))
+            .help("buffer size (in multiples of 4 KB)"))
         .arg(Arg::new("use-groups")
             .long("use-groups")
             .takes_value(false))
@@ -97,8 +98,12 @@ fn main() {
         compare_pattern = true;
     }
     if args.is_present("buffer") {
-        let buffer_size: u64 = args.value_of("buffer").unwrap().parse().expect("IO size must be a valid string");
-        io_size = buffer_size * MEGABYTE;
+        let buffer_size: u64 = args.value_of("buffer").unwrap().parse().expect("Buffer size must be a valid integer");
+        if buffer_size > 1024 {
+            println!("Buffer size must not exceed 4 MB");
+            exit(1);
+        }
+        io_size = buffer_size * PAGE_SIZE;
     } else {
         io_size = MEGABYTE;
     }
@@ -139,7 +144,8 @@ fn main() {
     // Threading logic to handle reads/writes
     let num_threads = threads;
     let (sender, receiver): (Sender<String>, Receiver<String>) = channel();
-    let (size, io_size, sector_size) = calculate_disk_info(disk_number, io_size);
+    let (size, mut io_size, sector_size) = calculate_disk_info(disk_number, io_size);
+
     let mut limit = size;
     if args.is_present("limit (GB)") {
         limit = args.value_of("limit (GB)").unwrap().parse().expect("I/O MB limit must be a valid integer");
@@ -147,6 +153,12 @@ fn main() {
     } else if args.is_present("limit (MB)") {
         limit = args.value_of("limit (MB)").unwrap().parse().expect("I/O GB limit must be a valid integer");
         limit *= MEGABYTE;
+    }
+
+    // Reset buffer size if necessary to avoid race conditions during threaded operations
+    if threads * io_size > limit {
+        io_size = calculate_nearest_multiple(PAGE_SIZE, limit / threads);
+        println!("Reducing I/O operation size to {} bytes to accomodate thread count", io_size);
     }
     
     println!("Disk {} size: {} bytes", disk_number, size);
@@ -252,24 +264,23 @@ fn open_handle(path: &str, handle_type: char) -> Result<Foundation::HANDLE, Stri
 }
 
 // Conduct threaded IO operation (read/write)
-fn thread_io(sender: std::sync::mpsc::Sender<String>, disk_number: u8, num_threads: u64, id: u64, io_size: u64, limit: u64, io_type: char, pattern: u64) {
-    let full_io_size: u64 = limit / num_threads;
+fn thread_io(sender: std::sync::mpsc::Sender<String>, disk_number: u8, num_threads: u64, id: u64, io_size: u64, size: u64, io_type: char, pattern: u64) {
+    let mut initialization_offset = 0;
+    if io_type == 'w' {   // Add 4 KB offset to all operations to avoid overwriting drive
+        initialization_offset = INITIALIZATION_OFFSET;
+    }
+    let local_limit = calculate_nearest_multiple(PAGE_SIZE, size / num_threads);     // Align full IO size
     let path: String = format_drive_num(disk_number);
     let handle: Foundation::HANDLE = open_handle(&path, io_type).unwrap();
 
     // Set up FilePointer to start at offset based on thread number
-    let mut offset = (id - 1) * full_io_size;
+    let mut offset = (id - 1) * local_limit;
 
     // Set up data pattern
     let pattern_data: Vec<u64> = vec![pattern; io_size as usize / std::mem::size_of::<u64>()];
 
     // Reset offset if not an even multiple of page size (4k bytes)
     offset = calculate_nearest_multiple(PAGE_SIZE, offset);
-
-    let mut initialization_offset = 0;
-    if io_type == 'w' && id == 1 {   // Add 1 MB offset for the first thread to avoid uninitializing drive
-        initialization_offset += MEGABYTE;
-    }
 
     let _pointer = unsafe {
         FileSystem::SetFilePointerEx(
@@ -290,11 +301,11 @@ fn thread_io(sender: std::sync::mpsc::Sender<String>, disk_number: u8, num_threa
         )
     };
     
-
+    // I/O logistics
     let mut bytes_completed: u32 = 0;
     let bytes_completed_ptr: *mut u32 = &mut bytes_completed;
     let mut pos: u64 = offset;
-    let last_pos: u64 = full_io_size * id - io_size - initialization_offset;
+    let last_pos: u64 = local_limit * id - io_size;
 
     if io_type == 'w' {
         // Set up references for write buffer and copy pattern data into buffer 
@@ -358,12 +369,12 @@ fn thread_io(sender: std::sync::mpsc::Sender<String>, disk_number: u8, num_threa
 // Multithreaded write/compare data patterns
 fn thread_data_pattern_io(sender: std::sync::mpsc::Sender<String>, num_threads: u64, id: u64, disk_number: u8, mut original_pattern: u64, size: u64, _sector_size: u64, io_size: u64) {
     let mut pattern = original_pattern;     // For data comparisons
-    let full_io_size = size / num_threads;
+    let local_limit = calculate_nearest_multiple(PAGE_SIZE, size / num_threads);     // Align full IO size
     let path = format_drive_num(disk_number);
     let handle = open_handle(&path, 'w').unwrap();
 
     // Set up FilePointer to start at offset based on thread number
-    let mut offset = (id - 1) * full_io_size;
+    let mut offset = (id - 1) * local_limit;
 
     // Reset offset if not an even multiple of page size (4k bytes)
     offset = calculate_nearest_multiple(PAGE_SIZE, offset);
@@ -371,15 +382,11 @@ fn thread_data_pattern_io(sender: std::sync::mpsc::Sender<String>, num_threads: 
     // Set up data pattern
     let mut pattern_data: Vec<u64> = vec![pattern; io_size as usize / std::mem::size_of::<u64>()];
 
-    let mut initialization_offset = 0;
-    if id == 1 {   // Add 1 MB offset for the first thread to avoid uninitializing drive
-        initialization_offset += MEGABYTE;
-    }
-
+    // Move file pointer based on calculated byte offset
     let mut _pointer = unsafe {
         FileSystem::SetFilePointerEx(
             handle,
-            (offset + initialization_offset) as i64,
+            (offset + INITIALIZATION_OFFSET) as i64,
             null_mut(),
             FileSystem::FILE_BEGIN
         )
@@ -417,8 +424,7 @@ fn thread_data_pattern_io(sender: std::sync::mpsc::Sender<String>, num_threads: 
     let mut bytes_completed: u32 = 0;
     let bytes_completed_ptr: *mut u32 = &mut bytes_completed;
     let mut pos: u64 = offset;
-    let last_pos: u64 = full_io_size * id - io_size - initialization_offset;
-
+    let last_pos: u64 = local_limit * id - io_size;
     let mut received: u64;
 
     // Set up raw pointer and reference for read buffer
@@ -448,6 +454,7 @@ fn thread_data_pattern_io(sender: std::sync::mpsc::Sender<String>, num_threads: 
     }
     let mut iterations = 0;
 
+    // 64 iterations to allow complete bit shift
     while iterations < 64 {
         // Shift pattern and modify write buffer
         original_pattern = pattern;
@@ -460,7 +467,7 @@ fn thread_data_pattern_io(sender: std::sync::mpsc::Sender<String>, num_threads: 
         _pointer = unsafe {
             FileSystem::SetFilePointerEx(
                 handle,
-                (offset + initialization_offset) as i64,
+                (offset + INITIALIZATION_OFFSET) as i64,
                 null_mut(),
                 FileSystem::FILE_BEGIN
             )
@@ -489,7 +496,7 @@ fn thread_data_pattern_io(sender: std::sync::mpsc::Sender<String>, num_threads: 
             received = read_buf[0];
             if received != original_pattern {
                 println!(   
-                    "Data mismatch at thread {}! Actual({:#018x}) vs Expected({:#018x})", id, received, original_pattern
+                    "Data mismatch at thread {} iteration {}! Actual({:#018x}) vs Expected({:#018x})", id, iterations, received, original_pattern
                 );
             }
 
