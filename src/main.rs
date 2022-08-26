@@ -66,6 +66,11 @@ fn main() {
             .long("pattern")
             .takes_value(true)
             .help("Data pattern to write to drive"))
+        .arg(Arg::new("iterations")
+            .short('i')
+            .long("iterations")
+            .takes_value(true)
+            .help("Number of times to conduct I/O operation"))
         .arg(Arg::new("buffer")
             .short('b')
             .long("buffer")
@@ -99,11 +104,78 @@ fn main() {
     let mut multiple_groups: bool = false;
     let io_type: char;      // Identifier for opening handle and conducting IO
     let mut log_type: &str = "info";
+    let mut iterations: u64 = 1;    // Number of times to run I/O operations
 
     // Set logging type
     if args.is_present("log") {
         log_type = "debug"
     }
+    // Set up logging
+    env_logger::init_from_env(
+        env_logger::Env::default().filter_or(env_logger::DEFAULT_FILTER_ENV, log_type));
+
+    if args.is_present("iterations") {
+        iterations = args.value_of("iterations").unwrap().parse().expect("Number of iterations must be a positive integer");
+        info!("Program will run {} times", iterations);
+    }
+    
+    if args.is_present("threads") {
+        threads = args.value_of("threads").unwrap().parse().expect("Thread count must be a positive integer");
+    }
+    if args.is_present("use-groups") {
+        multiple_groups = true;
+    }
+    if args.is_present("pattern") {
+        pattern_str = args.value_of("pattern").unwrap().parse().expect("Pattern must be a valid string");
+        compare_pattern = true;
+        info!("Data Comparison mode selected");
+    }
+    if args.is_present("buffer") {
+        let buffer_size: u64 = args.value_of("buffer").unwrap().parse().expect("Buffer size must be a valid integer");
+        if buffer_size > 1024 {
+            error!("Buffer size must not exceed 4 MB, exiting...");
+            exit(1);
+        }
+        io_size = buffer_size * PAGE_SIZE;
+    } else {
+        io_size = MEGABYTE;
+    }
+    if args.is_present("read") {
+        disk_number = args.value_of("read").unwrap().parse().expect("Disk number must be a valid integer");
+        partitions = get_partitions(disk_number);
+        if partitions > 1 {
+            error!("Cannot conduct read IO operations on disk with multiple partitions, exiting...");
+            exit(1);
+        }
+        io_type = 'r';
+        info!("Read mode selected");
+    } else if args.is_present("write") {
+        disk_number = args.value_of("write").unwrap().parse().expect("Disk number must be a valid integer");
+        partitions = get_partitions(disk_number);
+        if partitions > 1 {
+            error!("Cannot conduct write IO operations on disk with multiple partitions, exiting...");
+            exit(1);
+        }
+        io_type = 'w';
+        info!("Write mode selected");
+    } else {
+        // TODO: Get Identify Controller
+        if args.is_present("controller") {
+            disk_number = args.value_of("controller").unwrap().parse().expect("Disk number must be a valid integer!");
+            let path = format_drive_num(disk_number);
+            let handle: Foundation::HANDLE = open_handle(&path, 'r').unwrap();
+            id_controller(handle);
+            return;
+
+        // TODO: Get Identify Namespace
+
+        // TODO: Get Firmware Info
+        }
+
+        warn!("Please specify an IO operation (--help for more information)");
+        exit(0);
+    }
+    info!("Data pattern: {}{}", "0x", pattern_str);
 
     // Print disk information
     if args.is_present("info") {
@@ -139,64 +211,6 @@ fn main() {
                 println!("Error: {}", e);
             }
         } 
-    }
-
-    // Set up logging
-    env_logger::init_from_env(
-        env_logger::Env::default().filter_or(env_logger::DEFAULT_FILTER_ENV, log_type));
-    
-    if args.is_present("threads") {
-        threads = args.value_of("threads").unwrap().parse().expect("Thread count must be a positive integer");
-    }
-    if args.is_present("use-groups") {
-        multiple_groups = true;
-    }
-    if args.is_present("pattern") {
-        pattern_str = args.value_of("pattern").unwrap().parse().expect("Pattern must be a valid string");
-        compare_pattern = true;
-    }
-    if args.is_present("buffer") {
-        let buffer_size: u64 = args.value_of("buffer").unwrap().parse().expect("Buffer size must be a valid integer");
-        if buffer_size > 1024 {
-            error!("Buffer size must not exceed 4 MB, exiting...");
-            exit(1);
-        }
-        io_size = buffer_size * PAGE_SIZE;
-    } else {
-        io_size = MEGABYTE;
-    }
-    if args.is_present("read") {
-        disk_number = args.value_of("read").unwrap().parse().expect("Disk number must be a valid integer");
-        partitions = get_partitions(disk_number);
-        if partitions > 1 {
-            error!("Cannot conduct read IO operations on disk with multiple partitions, exiting...");
-            exit(1);
-        }
-        io_type = 'r';
-    } else if args.is_present("write") {
-        disk_number = args.value_of("write").unwrap().parse().expect("Disk number must be a valid integer");
-        partitions = get_partitions(disk_number);
-        if partitions > 1 {
-            error!("Cannot conduct write IO operations on disk with multiple partitions, exiting...");
-            exit(1);
-        }
-        io_type = 'w';
-    } else {
-        // TODO: Get Identify Controller
-        if args.is_present("controller") {
-            disk_number = args.value_of("controller").unwrap().parse().expect("Disk number must be a valid integer!");
-            let path = format_drive_num(disk_number);
-            let handle: Foundation::HANDLE = open_handle(&path, 'r').unwrap();
-            id_controller(handle);
-            return;
-
-        // TODO: Get Identify Namespace
-
-        // TODO: Get Firmware Info
-        }
-
-        warn!("Please specify an IO operation (--help for more information)");
-        exit(0);
     }
 
     // Threading logic to handle reads/writes
@@ -235,9 +249,9 @@ fn main() {
             let affinity: Vec<usize> = vec![(threads % num_cores as u64) as usize; 1];      // Wrap threads around 
             let _ = set_thread_affinity(affinity);      // Pin thread to single CPU core
             if compare_pattern {
-                conduct_data_comparison(sen_clone, num_threads, threads.clone(), disk_number, pattern, limit, sector_size, io_size);
+                conduct_data_comparison(sen_clone, num_threads, threads.clone(), disk_number, pattern, limit, sector_size, io_size, iterations);
             } else {
-                conduct_io_operation(sen_clone, disk_number, num_threads, threads.clone(), io_size, limit, io_type, pattern);
+                conduct_io_operation(sen_clone, disk_number, num_threads, threads.clone(), io_size, limit, io_type, pattern, iterations);
             }
         });
         threads -= 1;
@@ -323,7 +337,7 @@ fn open_handle(path: &str, handle_type: char) -> Result<Foundation::HANDLE, Stri
 }
 
 // Conduct threaded IO operation (read/write)
-fn conduct_io_operation(sender: std::sync::mpsc::Sender<String>, disk_number: u8, num_threads: u64, id: u64, io_size: u64, size: u64, io_type: char, pattern: u64) {
+fn conduct_io_operation(sender: std::sync::mpsc::Sender<String>, disk_number: u8, num_threads: u64, id: u64, io_size: u64, size: u64, io_type: char, pattern: u64, loops: u64) {
     let mut initialization_offset = 0;
     if io_type == 'w' {   // Add 4 KB offset to all operations to avoid overwriting drive
         initialization_offset = INITIALIZATION_OFFSET;
@@ -341,17 +355,8 @@ fn conduct_io_operation(sender: std::sync::mpsc::Sender<String>, disk_number: u8
     // Reset offset if not an even multiple of page size (4k bytes)
     offset = calculate_nearest_multiple(PAGE_SIZE, offset);
 
-    let _pointer = unsafe {
-        FileSystem::SetFilePointerEx(
-            handle,
-            (offset + initialization_offset) as i64,
-            null_mut(),
-            FileSystem::FILE_BEGIN
-        )
-    };
-
-    // Allocate sector-aligned buffer with Win32 VirtualAlloc
-    let buffer: LPVOID = unsafe {
+     // Allocate sector-aligned buffer with Win32 VirtualAlloc
+     let buffer: LPVOID = unsafe {
         VirtualAlloc(
             null_mut(),
             io_size as usize,
@@ -359,63 +364,75 @@ fn conduct_io_operation(sender: std::sync::mpsc::Sender<String>, disk_number: u8
             PAGE_EXECUTE_READWRITE
         )
     };
-    
-    // I/O logistics
-    let mut bytes_completed: u32 = 0;
-    let bytes_completed_ptr: *mut u32 = &mut bytes_completed;
-    let mut pos: u64 = offset;
-    let last_pos: u64 = local_limit * id - io_size;
 
-    if io_type == 'w' {
-        // Set up references for write buffer and copy pattern data into buffer 
-        let write_buffer_ptr_raw: *mut [u64] = std::ptr::slice_from_raw_parts_mut(buffer, io_size as usize / std::mem::size_of::<u64>()) as *mut [u64];
-        let write_buf: &mut [u64];
-        unsafe {
-            let buf_ptr: *mut [u64] = write_buffer_ptr_raw as *mut [u64];
-            write_buf = &mut *buf_ptr;
-            write_buf.copy_from_slice(&pattern_data);
-        }
-        let now = Instant::now();
-        while pos <= last_pos {
-            let write = unsafe {
-                FileSystem::WriteFile(
-                    handle,
-                    buffer,
-                    io_size as DWORD,
-                    bytes_completed_ptr,
-                    null_mut()
-                )
-            };
-            pos += bytes_completed as u64;
-            if write == false {
-                error!("Thread {} encountered Error Code {}", id, win32::last_error());
-                break;
-            }
-    }
-        let elapsed_time = now.elapsed();
-        debug!("Thread {} took {} seconds to finish writing", id, elapsed_time.as_secs());
-    } else if io_type == 'r' {
-        let now = Instant::now();
-        while pos <= last_pos {
-            let read = unsafe {
-                FileSystem::ReadFile(
-                    handle,
-                    buffer,
-                    io_size as DWORD,
-                    bytes_completed_ptr,
-                    null_mut()
-                )
-            };
-            pos += bytes_completed as u64;
-            if read == false { 
-                error!("Thread {} encountered Error Code {}", id, win32::last_error());
-                break;
-            }
-        }
-        let elapsed_time = now.elapsed();
-        debug!("Thread {} took {} seconds to finish reading", id, elapsed_time.as_secs());
-    }
+    let mut i: u64 = 0;
+    while i < loops {
+        let _pointer = unsafe {
+            FileSystem::SetFilePointerEx(
+                handle,
+                (offset + initialization_offset) as i64,
+                null_mut(),
+                FileSystem::FILE_BEGIN
+            )
+        };
+        
+        // I/O logistics
+        let mut bytes_completed: u32 = 0;
+        let bytes_completed_ptr: *mut u32 = &mut bytes_completed;
+        let mut pos: u64 = offset;
+        let last_pos: u64 = local_limit * id - io_size;
 
+        if io_type == 'w' {
+            // Set up references for write buffer and copy pattern data into buffer 
+            let write_buffer_ptr_raw: *mut [u64] = std::ptr::slice_from_raw_parts_mut(buffer, io_size as usize / std::mem::size_of::<u64>()) as *mut [u64];
+            let write_buf: &mut [u64];
+            unsafe {
+                let buf_ptr: *mut [u64] = write_buffer_ptr_raw as *mut [u64];
+                write_buf = &mut *buf_ptr;
+                write_buf.copy_from_slice(&pattern_data);
+            }
+            let now = Instant::now();
+            while pos <= last_pos {
+                let write = unsafe {
+                    FileSystem::WriteFile(
+                        handle,
+                        buffer,
+                        io_size as DWORD,
+                        bytes_completed_ptr,
+                        null_mut()
+                    )
+                };
+                pos += bytes_completed as u64;
+                if write == false {
+                    error!("Thread {} encountered Error Code {}", id, win32::last_error());
+                    break;
+                }
+        }
+            let elapsed_time = now.elapsed();
+            debug!("Thread {} took {} seconds to finish writing", id, elapsed_time.as_secs());
+        } else if io_type == 'r' {
+            let now = Instant::now();
+            while pos <= last_pos {
+                let read = unsafe {
+                    FileSystem::ReadFile(
+                        handle,
+                        buffer,
+                        io_size as DWORD,
+                        bytes_completed_ptr,
+                        null_mut()
+                    )
+                };
+                pos += bytes_completed as u64;
+                if read == false { 
+                    error!("Thread {} encountered Error Code {}", id, win32::last_error());
+                    break;
+                }
+            }
+            let elapsed_time = now.elapsed();
+            debug!("Thread {} took {} seconds to finish reading", id, elapsed_time.as_secs());
+        }
+        i += 1;
+    }
     unsafe {
         // Clean up resources
         VirtualFree(buffer, 0, MEM_RELEASE);
@@ -426,7 +443,7 @@ fn conduct_io_operation(sender: std::sync::mpsc::Sender<String>, disk_number: u8
 
 
 // Multithreaded write/compare data patterns
-fn conduct_data_comparison(sender: std::sync::mpsc::Sender<String>, num_threads: u64, id: u64, disk_number: u8, mut original_pattern: u64, size: u64, _sector_size: u64, io_size: u64) {
+fn conduct_data_comparison(sender: std::sync::mpsc::Sender<String>, num_threads: u64, id: u64, disk_number: u8, mut original_pattern: u64, size: u64, _sector_size: u64, io_size: u64, loops: u64) {
     let mut pattern = original_pattern;     // For data comparisons
     let local_limit = calculate_nearest_multiple(PAGE_SIZE, size / num_threads);     // Align full IO size
     let path = format_drive_num(disk_number);
@@ -440,16 +457,6 @@ fn conduct_data_comparison(sender: std::sync::mpsc::Sender<String>, num_threads:
 
     // Set up data pattern
     let mut pattern_data: Vec<u64> = vec![pattern; io_size as usize / std::mem::size_of::<u64>()];
-
-    // Move file pointer based on calculated byte offset
-    let mut _pointer = unsafe {
-        FileSystem::SetFilePointerEx(
-            handle,
-            (offset + INITIALIZATION_OFFSET) as i64,
-            null_mut(),
-            FileSystem::FILE_BEGIN
-        )
-    };
 
     // Allocate sector-aligned buffers with Win32 VirtualAlloc
     let write_buffer: LPVOID = unsafe {
@@ -479,52 +486,11 @@ fn conduct_data_comparison(sender: std::sync::mpsc::Sender<String>, num_threads:
         )
     };
 
-    // I/O logistics
-    let mut bytes_completed: u32 = 0;
-    let bytes_completed_ptr: *mut u32 = &mut bytes_completed;
-    let mut pos: u64 = offset;
-    let last_pos: u64 = local_limit * id - io_size;
-    let mut received: u64;
-
-    // Set up raw pointer and reference for read buffer
-    let mut read_buffer_ptr_raw: *mut [u64];
-    let mut read_buf: &mut [u64];
-
-    // Full write
+    let mut i: u64 = 0;
     let now = Instant::now();
-    while pos <= last_pos as u64 {
-
-        // Write to drive
-        let write = unsafe {
-            FileSystem::WriteFile(
-                handle,
-                write_buffer,
-                io_size as DWORD,
-                bytes_completed_ptr,
-                null_mut()
-            )
-        };
-
-        pos += bytes_completed as u64;
-
-        if write == false {
-            error!("Thread {} encountered Error Code {}", id, win32::last_error());
-            break;
-        }
-    }
-    let mut iterations = 0;
-
-    // 64 iterations to allow complete bit shift
-    while iterations < 64 {
-        // Shift pattern and modify write buffer
-        original_pattern = pattern;
-        pattern = bit_shift(pattern, 1);
-        pattern_data = vec![pattern; io_size as usize / std::mem::size_of::<u64>()];
-        write_buf.copy_from_slice(&pattern_data);
-
-        // Reset position and move pointer back to initial offset to conduct read
-        pos = offset;
-        _pointer = unsafe {
+    while i < loops {
+        // Move file pointer based on calculated byte offset
+        let mut _pointer = unsafe {
             FileSystem::SetFilePointerEx(
                 handle,
                 (offset + INITIALIZATION_OFFSET) as i64,
@@ -533,50 +499,21 @@ fn conduct_data_comparison(sender: std::sync::mpsc::Sender<String>, num_threads:
             )
         };
 
-        // Full read/compare
-        while pos <= last_pos {
-            let read = unsafe {
-                FileSystem::ReadFile(
-                    handle,
-                    read_buffer,
-                    io_size as DWORD,
-                    bytes_completed_ptr,
-                    null_mut()
-                )
-            };
+        // I/O logistics
+        let mut bytes_completed: u32 = 0;
+        let bytes_completed_ptr: *mut u32 = &mut bytes_completed;
+        let mut pos: u64 = offset;
+        let last_pos: u64 = local_limit * id - io_size;
+        let mut received: u64;
 
-            // Retrieve data from read buffer for comparison
-            read_buffer_ptr_raw = std::ptr::slice_from_raw_parts_mut(read_buffer, io_size as usize / std::mem::size_of::<u64>()) as *mut [u64];
-            unsafe {
-                let buf_ptr: *mut [u64] = read_buffer_ptr_raw as *mut [u64];
-                read_buf = &mut *buf_ptr;
-            }
+        // Set up raw pointer and reference for read buffer
+        let mut read_buffer_ptr_raw: *mut [u64];
+        let mut read_buf: &mut [u64];
 
-            // Compare read buffer to pattern
-            received = read_buf[0];
-            if received != original_pattern {
-                error!(   
-                    "Data mismatch at thread {} iteration {}! Actual({:#018x}) vs Expected({:#018x})", id, iterations, received, original_pattern
-                );
-            }
+        // Full write
+        while pos <= last_pos as u64 {
 
-            pos += bytes_completed as u64;
-            if read == false {
-                error!("Thread {} encountered Error Code {}", id, win32::last_error());
-                break;
-            }
-
-            // Move pointer back to conduct read
-            _pointer = unsafe {
-                FileSystem::SetFilePointerEx(
-                    handle,
-                    (bytes_completed as i64 * -1) as i64,
-                    null_mut(),
-                    FileSystem::FILE_CURRENT
-                )
-            };
-
-            // Write shifted pattern to same LBA
+            // Write to drive
             let write = unsafe {
                 FileSystem::WriteFile(
                     handle,
@@ -587,12 +524,96 @@ fn conduct_data_comparison(sender: std::sync::mpsc::Sender<String>, num_threads:
                 )
             };
 
+            pos += bytes_completed as u64;
+
             if write == false {
                 error!("Thread {} encountered Error Code {}", id, win32::last_error());
                 break;
             }
         }
-        iterations += 1;
+        let mut iterations = 0;
+
+        // 64 iterations to allow complete bit shift
+        while iterations < 64 {
+            // Shift pattern and modify write buffer
+            original_pattern = pattern;
+            pattern = bit_shift(pattern, 1);
+            pattern_data = vec![pattern; io_size as usize / std::mem::size_of::<u64>()];
+            write_buf.copy_from_slice(&pattern_data);
+
+            // Reset position and move pointer back to initial offset to conduct read
+            pos = offset;
+            _pointer = unsafe {
+                FileSystem::SetFilePointerEx(
+                    handle,
+                    (offset + INITIALIZATION_OFFSET) as i64,
+                    null_mut(),
+                    FileSystem::FILE_BEGIN
+                )
+            };
+
+            // Full read/compare
+            while pos <= last_pos {
+                let read = unsafe {
+                    FileSystem::ReadFile(
+                        handle,
+                        read_buffer,
+                        io_size as DWORD,
+                        bytes_completed_ptr,
+                        null_mut()
+                    )
+                };
+
+                // Retrieve data from read buffer for comparison
+                read_buffer_ptr_raw = std::ptr::slice_from_raw_parts_mut(read_buffer, io_size as usize / std::mem::size_of::<u64>()) as *mut [u64];
+                unsafe {
+                    let buf_ptr: *mut [u64] = read_buffer_ptr_raw as *mut [u64];
+                    read_buf = &mut *buf_ptr;
+                }
+
+                // Compare read buffer to pattern
+                received = read_buf[0];
+                if received != original_pattern {
+                    error!(   
+                        "Data mismatch at thread {} iteration {}! Actual({:#018x}) vs Expected({:#018x})", id, iterations, received, original_pattern
+                    );
+                }
+
+                pos += bytes_completed as u64;
+                if read == false {
+                    error!("Thread {} encountered Error Code {}", id, win32::last_error());
+                    break;
+                }
+
+                // Move pointer back to conduct read
+                _pointer = unsafe {
+                    FileSystem::SetFilePointerEx(
+                        handle,
+                        (bytes_completed as i64 * -1) as i64,
+                        null_mut(),
+                        FileSystem::FILE_CURRENT
+                    )
+                };
+
+                // Write shifted pattern to same LBA
+                let write = unsafe {
+                    FileSystem::WriteFile(
+                        handle,
+                        write_buffer,
+                        io_size as DWORD,
+                        bytes_completed_ptr,
+                        null_mut()
+                    )
+                };
+
+                if write == false {
+                    error!("Thread {} encountered Error Code {}", id, win32::last_error());
+                    break;
+                }
+            }
+            iterations += 1;
+        }
+        i += 1;
     }
     let elapsed_time = now.elapsed();
     debug!("Thread {} took {} seconds to finish", id, elapsed_time.as_secs());
