@@ -7,6 +7,10 @@ use std::{time::Instant, mem::{size_of, drop}, ptr::{null_mut, null}, process::e
 use winapi::{shared::minwindef::{DWORD, LPVOID}, um::{fileapi::OPEN_EXISTING, winbase::FILE_FLAG_NO_BUFFERING, winnt::{FILE_SHARE_READ, FILE_SHARE_WRITE, GENERIC_WRITE, GENERIC_READ, MEM_COMMIT, MEM_RESERVE, MEM_RELEASE, PAGE_EXECUTE_READWRITE}, memoryapi::{VirtualAlloc, VirtualFree}}};
 use affinity::*;
 use std::num::ParseIntError;
+use log::{debug, error, warn, info};
+use json::{object, JsonValue};
+use std::fs::{File, remove_file};
+use std::io::prelude::*;
 
 // TODO: Use memcpy and comparison to compare rather than just first element
 
@@ -28,6 +32,10 @@ fn main() {
         .version("v1.1.0")
         .author("Arjun Srivastava, Microsoft CHIE - ASE")
         .about("CLI to analyze and conduct multithreaded read/write IO operations and data comparisons on single-partition physical disks")
+        .arg(Arg::new("info")
+            .long("info")
+            .takes_value(false)
+            .help("Print information about physical drives"))
         .arg(Arg::new("write")
             .short('w')
             .long("write")
@@ -66,6 +74,9 @@ fn main() {
         .arg(Arg::new("use-groups")
             .long("use-groups")
             .takes_value(false))
+        .arg(Arg::new("log")
+            .long("log")
+            .takes_value(false))
         .arg(Arg::new("controller")
             .short('c')
             .long("controller")
@@ -87,6 +98,53 @@ fn main() {
     let mut threads: u64 = 1;
     let mut multiple_groups: bool = false;
     let io_type: char;      // Identifier for opening handle and conducting IO
+    let mut log_type: &str = "info";
+
+    // Set logging type
+    if args.is_present("log") {
+        log_type = "debug"
+    }
+
+    // Print disk information
+    if args.is_present("info") {
+        let get_physicaldisks_script = include_str!("get_physicaldisks.ps1");
+        match powershell_script::run(get_physicaldisks_script) {
+            Ok(output) => {
+                let stdout = String::from(output.stdout().unwrap());
+                let mut id_json = json::JsonValue::new_array();
+		        parse_script(&stdout, &mut id_json);
+                let serialized = json::stringify(id_json);
+                let mut file = File::create("disk_info.json").expect("Error encountered while creating file!");
+                file.write_all(serialized.as_bytes()).expect("Error writing disk information to file");
+                let ps = powershell_script::PsScriptBuilder::new()
+                    .no_profile(true)
+                    .non_interactive(true)
+                    .hidden(false)
+                    .print_commands(false)
+                    .build();
+                let output = ps.run(r#"
+                    $DiskInfo = Get-Content ./disk_info.json | ConvertFrom-Json
+                    foreach ($Disk in $DiskInfo) {
+                        $DiskNumber = $Disk.DeviceId
+                        [array]$Partitions = Get-Partition $DiskNumber
+                        $Disk | Add-Member -MemberType NoteProperty -Name 'Partitions' -Value ($Partitions.count)
+                    }
+                    $Table = $DiskInfo | Format-Table 'DeviceId', 'FriendlyName', 'SerialNumber', 'MediaType', 'Partitions', 'Sector Size'
+                    Write-Output $Table
+                "#).unwrap();
+                println!("{}", output.stdout().unwrap());
+                let _result = remove_file("./disk_info.json").expect("Encountered error removing temporary JSON file");
+            }
+            Err(e) => {
+                println!("Error: {}", e);
+            }
+        } 
+    }
+
+    // Set up logging
+    env_logger::init_from_env(
+        env_logger::Env::default().filter_or(env_logger::DEFAULT_FILTER_ENV, log_type));
+    
     if args.is_present("threads") {
         threads = args.value_of("threads").unwrap().parse().expect("Thread count must be a positive integer");
     }
@@ -100,7 +158,7 @@ fn main() {
     if args.is_present("buffer") {
         let buffer_size: u64 = args.value_of("buffer").unwrap().parse().expect("Buffer size must be a valid integer");
         if buffer_size > 1024 {
-            println!("Buffer size must not exceed 4 MB");
+            error!("Buffer size must not exceed 4 MB, exiting...");
             exit(1);
         }
         io_size = buffer_size * PAGE_SIZE;
@@ -111,7 +169,7 @@ fn main() {
         disk_number = args.value_of("read").unwrap().parse().expect("Disk number must be a valid integer");
         partitions = get_partitions(disk_number);
         if partitions > 1 {
-            println!("Cannot conduct read IO operations on disk with multiple partitions, exiting...");
+            error!("Cannot conduct read IO operations on disk with multiple partitions, exiting...");
             exit(1);
         }
         io_type = 'r';
@@ -119,7 +177,7 @@ fn main() {
         disk_number = args.value_of("write").unwrap().parse().expect("Disk number must be a valid integer");
         partitions = get_partitions(disk_number);
         if partitions > 1 {
-            println!("Cannot conduct write IO operations on disk with multiple partitions, exiting...");
+            error!("Cannot conduct write IO operations on disk with multiple partitions, exiting...");
             exit(1);
         }
         io_type = 'w';
@@ -137,7 +195,7 @@ fn main() {
         // TODO: Get Firmware Info
         }
 
-        println!("Please specify an IO operation (--help for more information)");
+        warn!("Please specify an IO operation (--help for more information)");
         exit(0);
     }
 
@@ -158,10 +216,10 @@ fn main() {
     // Reset buffer size if necessary to avoid race conditions during threaded operations
     if threads * io_size > limit {
         io_size = calculate_nearest_multiple(PAGE_SIZE, limit / threads);
-        println!("Reducing I/O operation size to {} bytes to accomodate thread count", io_size);
+        warn!("Reducing I/O operation size to {} bytes to accomodate thread count", io_size);
     }
     
-    println!("Disk {} size: {} bytes", disk_number, size);
+    info!("Disk {} size: {} bytes", disk_number, size);
     let num_cores = get_core_num();     // CPU cores in the current processor group
     pattern = parse_hex(&pattern_str).unwrap();
     while threads != 0 {
@@ -177,9 +235,9 @@ fn main() {
             let affinity: Vec<usize> = vec![(threads % num_cores as u64) as usize; 1];      // Wrap threads around 
             let _ = set_thread_affinity(affinity);      // Pin thread to single CPU core
             if compare_pattern {
-                thread_data_pattern_io(sen_clone, num_threads, threads.clone(), disk_number, pattern, limit, sector_size, io_size);
+                conduct_data_comparison(sen_clone, num_threads, threads.clone(), disk_number, pattern, limit, sector_size, io_size);
             } else {
-                thread_io(sen_clone, disk_number, num_threads, threads.clone(), io_size, limit, io_type, pattern);
+                conduct_io_operation(sen_clone, disk_number, num_threads, threads.clone(), io_size, limit, io_type, pattern);
             }
         });
         threads -= 1;
@@ -194,16 +252,17 @@ fn main() {
         for i in receiver {
             let isplit = i.split("|");
             if isplit.clone().next().unwrap()=="finished" {
-                println!("[Thread {}]: Status: {}", isplit.clone().last().unwrap(), isplit.clone().next().unwrap());
+                debug!("[Thread {}]: Status: {}", isplit.clone().last().unwrap(), isplit.clone().next().unwrap());
                 threads_clone -= 1;
                 if threads_clone == 0 {
-                    println!("{}", "Task is finished!");
+                    info!("{}", "All pending I/O operations finished");
                     break;
                 }
             }
         }
     });
     receiver_thread.join().unwrap();
+    info!("{}", "All pending I/O operations finished");
 }
 
 
@@ -264,7 +323,7 @@ fn open_handle(path: &str, handle_type: char) -> Result<Foundation::HANDLE, Stri
 }
 
 // Conduct threaded IO operation (read/write)
-fn thread_io(sender: std::sync::mpsc::Sender<String>, disk_number: u8, num_threads: u64, id: u64, io_size: u64, size: u64, io_type: char, pattern: u64) {
+fn conduct_io_operation(sender: std::sync::mpsc::Sender<String>, disk_number: u8, num_threads: u64, id: u64, io_size: u64, size: u64, io_type: char, pattern: u64) {
     let mut initialization_offset = 0;
     if io_type == 'w' {   // Add 4 KB offset to all operations to avoid overwriting drive
         initialization_offset = INITIALIZATION_OFFSET;
@@ -329,12 +388,12 @@ fn thread_io(sender: std::sync::mpsc::Sender<String>, disk_number: u8, num_threa
             };
             pos += bytes_completed as u64;
             if write == false {
-                println!("Thread {} encountered Error Code {}", id, win32::last_error());
+                error!("Thread {} encountered Error Code {}", id, win32::last_error());
                 break;
             }
     }
         let elapsed_time = now.elapsed();
-        println!("Thread {} took {} seconds to finish writing", id, elapsed_time.as_secs());
+        debug!("Thread {} took {} seconds to finish writing", id, elapsed_time.as_secs());
     } else if io_type == 'r' {
         let now = Instant::now();
         while pos <= last_pos {
@@ -349,12 +408,12 @@ fn thread_io(sender: std::sync::mpsc::Sender<String>, disk_number: u8, num_threa
             };
             pos += bytes_completed as u64;
             if read == false { 
-                println!("Thread {} encountered Error Code {}", id, win32::last_error());
+                error!("Thread {} encountered Error Code {}", id, win32::last_error());
                 break;
             }
         }
         let elapsed_time = now.elapsed();
-        println!("Thread {} took {} seconds to finish reading", id, elapsed_time.as_secs());
+        debug!("Thread {} took {} seconds to finish reading", id, elapsed_time.as_secs());
     }
 
     unsafe {
@@ -367,7 +426,7 @@ fn thread_io(sender: std::sync::mpsc::Sender<String>, disk_number: u8, num_threa
 
 
 // Multithreaded write/compare data patterns
-fn thread_data_pattern_io(sender: std::sync::mpsc::Sender<String>, num_threads: u64, id: u64, disk_number: u8, mut original_pattern: u64, size: u64, _sector_size: u64, io_size: u64) {
+fn conduct_data_comparison(sender: std::sync::mpsc::Sender<String>, num_threads: u64, id: u64, disk_number: u8, mut original_pattern: u64, size: u64, _sector_size: u64, io_size: u64) {
     let mut pattern = original_pattern;     // For data comparisons
     let local_limit = calculate_nearest_multiple(PAGE_SIZE, size / num_threads);     // Align full IO size
     let path = format_drive_num(disk_number);
@@ -432,6 +491,7 @@ fn thread_data_pattern_io(sender: std::sync::mpsc::Sender<String>, num_threads: 
     let mut read_buf: &mut [u64];
 
     // Full write
+    let now = Instant::now();
     while pos <= last_pos as u64 {
 
         // Write to drive
@@ -448,7 +508,7 @@ fn thread_data_pattern_io(sender: std::sync::mpsc::Sender<String>, num_threads: 
         pos += bytes_completed as u64;
 
         if write == false {
-            println!("Thread {} encountered Error Code {}", id, win32::last_error());
+            error!("Thread {} encountered Error Code {}", id, win32::last_error());
             break;
         }
     }
@@ -495,14 +555,14 @@ fn thread_data_pattern_io(sender: std::sync::mpsc::Sender<String>, num_threads: 
             // Compare read buffer to pattern
             received = read_buf[0];
             if received != original_pattern {
-                println!(   
+                error!(   
                     "Data mismatch at thread {} iteration {}! Actual({:#018x}) vs Expected({:#018x})", id, iterations, received, original_pattern
                 );
             }
 
             pos += bytes_completed as u64;
             if read == false {
-                println!("Thread {} encountered Error Code {}", id, win32::last_error());
+                error!("Thread {} encountered Error Code {}", id, win32::last_error());
                 break;
             }
 
@@ -528,12 +588,14 @@ fn thread_data_pattern_io(sender: std::sync::mpsc::Sender<String>, num_threads: 
             };
 
             if write == false {
-                println!("Thread {} encountered Error Code {}", id, win32::last_error());
+                error!("Thread {} encountered Error Code {}", id, win32::last_error());
                 break;
             }
         }
         iterations += 1;
     }
+    let elapsed_time = now.elapsed();
+    debug!("Thread {} took {} seconds to finish", id, elapsed_time.as_secs());
     unsafe {
         // Clean up resources
         VirtualFree(read_buffer, 0, MEM_RELEASE);
@@ -573,6 +635,7 @@ fn format_drive_num(drive_num: u8) -> String {
 }
 
 
+// Shift number by given number of bytes
 fn bit_shift(data: u64, iterations: u64) -> u64 {
     let rotation = iterations % 16;        // Reset after each digit has been shifted once
     let bit_count = rotation * 4;
@@ -580,8 +643,62 @@ fn bit_shift(data: u64, iterations: u64) -> u64 {
 }
 
 
+
+
 fn parse_hex(src: &str) -> Result<u64, ParseIntError> {
     u64::from_str_radix(src, 16)
+}
+
+
+// Calculates sector size and adds it to JSON object
+fn get_physicaldisk(device_obj: &mut JsonValue, physical_number: u8) {
+    let result: Result<PhysicalDrive, std::string::String> = PhysicalDrive::open(physical_number);
+    let parsed_result = result.expect("Drive number does not exist on this machine");
+    let disk_geometry: DiskGeometry = parsed_result.geometry;
+    let sector_size = disk_geometry.size() / disk_geometry.sectors();
+    device_obj["Sector Size"] = sector_size.into();
+}
+
+// Parse the output of the PowerShell script (Get-PhysicalDisk)
+fn parse_script(stdout: &str, id_json: &mut JsonValue) { 
+    let slice = &stdout[2..stdout.len()];
+    let device_ids = slice.split(split_char);   
+    for mut device in device_ids {
+        device = device.trim();
+        if device.is_empty() {
+            continue;
+        }
+        let device_fields = device.split("; ");
+        let mut device_obj = object!{};
+        for field in device_fields {
+            // Parse individual fields
+            let field_split = field.split('=');
+            let mut identifier = "";
+            for item in field_split {
+                match item {
+                    "DeviceId" | "FriendlyName" | "SerialNumber" | "MediaType" => identifier = item,
+                    _ => {
+                        if identifier != "" {
+                            device_obj[identifier] = item.into();
+                            if identifier == "DeviceId" {
+                                let id = item.chars().next().expect("Error trying to parse empty string");
+                                let id_num: u32 = item.parse().unwrap();
+                                if id.is_numeric() {
+                                    get_physicaldisk(&mut device_obj, id_num as u8);
+                                }
+                            }
+                            identifier = "";
+                        }
+                    },
+                }
+            }
+        }
+        let _result = id_json.push(device_obj);
+    }
+}
+
+fn split_char(c: char) -> bool {
+    return c == '@' || c == '{' || c == '}';
 }
 
 
@@ -769,7 +886,7 @@ fn id_controller(h_device: Foundation::HANDLE) {
 
     if !result.as_bool() || (returned_length == 0) {
         status = win32::last_error();
-        println!("Get Identify Controller Data failed. Error Code {}", status);
+        error!("Get Identify Controller Data failed. Error Code {}", status);
         exit(1);
     }
 

@@ -23,11 +23,11 @@ This CLI allows you to run multithreaded read/write operations on physical stora
 4. `cargo run -- [FLAGS]` or run exe directly in `target/release/unbuffered_io.exe [FLAGS]`
 
 ## _**Usage**_
-Run `physical_disks.exe -a` in PowerShell to see a list of your machine's physical disks along with partition information, device health, etc.
 
+**This tool must be run with Administrator privileges in PowerShell**
 
 ```
-storagetiotool.exe -w/-r [disk #] -t [THREADS] -p [PATTERN] -g/-m [LIMIT] -b [SIZE]
+./storagetiotool.exe -w/-r [disk #] -t [THREADS] -p [PATTERN] -g/-m [LIMIT] -b [SIZE]
 ```
 
 ### Flags
@@ -46,9 +46,15 @@ storagetiotool.exe -w/-r [disk #] -t [THREADS] -p [PATTERN] -g/-m [LIMIT] -b [SI
 
 `-b` : Buffer/IO operation size (in multiples of 4 KB)
 
-## _**Example Use Cases**_
+`--use-groups` : Optional flag that allows program to utilize multiple processor groups for increased performance
 
-Output from `./physical_disks.exe -a`:
+`--log` : Enables logging
+
+`--info` : Print information about the machine's physical drives
+
+## _**Example Use Case: Data Comparison**_
+
+Output from `./storageiotool.exe --info`:
 
 ```
 DeviceId FriendlyName         SerialNumber                             MediaType Partitions Sector Size
@@ -57,12 +63,14 @@ DeviceId FriendlyName         SerialNumber                             MediaType
 
 ```
 
-### Data Comparison
+### Options
 `1*[>W 64*[>r,c,w~]]` is the supported data comparison pattern
 
 ```
-./storagetiotool.exe -w 0 -t 64 -p 0123456789abcdef -g 10 -b 4
+./storagetiotool.exe -w 0 -t 64 -p 0123456789abcdef -g 10 -b 4 --use-groups --log
 ```
 
-This set of commands will continuously write/read/compare/shift the pattern "0x0123456789abcdef" to the first 10 GB of the TOSHIBA storage device. The pattern will be written from a 1 MB pattern with 64 concurrent threads. Each write/read will be 16 KB.
+This set of commands will continuously write/read/compare/shift the pa  ttern "0x0123456789abcdef" to the first 10 GB of the TOSHIBA storage device. During the process, any anomalies such as data mismatches or Win32 errors will be printed to the console. With these parameters, the given pattern will be duplicated into a 16 KB buffer which will be continously written, shifted, and read, and compared by 64 concurrent threads. Each write/read will be 16 KB. Since this computers has many processor groups, `--use-groups` will slightly increase performance by pinning threads to processor cores across the groups. Logging is enabled
+
+### Output
 
