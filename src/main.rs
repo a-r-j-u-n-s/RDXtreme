@@ -101,7 +101,8 @@ fn main() {
     let pattern: u64;
     let mut compare_pattern: bool = false;
     let disk_number: u8;
-    let io_size: u64;
+    let buffer_size: u64;
+    let mut buffer_size_str: &str = "1m";
     let mut threads: u64 = 1;
     let mut multiple_groups: bool = false;
     let io_type: char;      // Identifier for opening handle and conducting IO
@@ -195,7 +196,6 @@ fn main() {
     }
     if args.is_present("use-groups") {
         multiple_groups = true;
-        info!("Program will attempt to utilize multiple processor groups to increase performance");
     }
     if args.is_present("pattern") {
         pattern_str = args.value_of("pattern").unwrap().parse().expect("Pattern must be a valid string");
@@ -203,14 +203,14 @@ fn main() {
         info!("Any Pattern 64 Bit Moving Inversions with Data Comparison 1*[>W 64*[>r,c,w~]]");
     }
     if args.is_present("buffer") {
-        let buffer_size: u64 = args.value_of("buffer").unwrap().parse().expect("Buffer size must be a valid integer");
-        if buffer_size > 1024 {
-            error!("Buffer size must not exceed 4 MB, exiting...");
+        buffer_size_str = args.value_of("buffer").unwrap();
+        buffer_size = get_buffer_size(buffer_size_str);
+        if buffer_size == 0 {
             exit(1);
         }
-        io_size = buffer_size * PAGE_SIZE;
+        // buffer_size = buffer_size * PAGE_SIZE;
     } else {
-        io_size = MEGABYTE;
+        buffer_size = MEGABYTE;
     }
 
     info!("Data pattern: {}{}", "0x", pattern_str);
@@ -218,7 +218,7 @@ fn main() {
     // Threading logic to handle reads/writes
     let num_threads = threads;
     let (sender, receiver): (Sender<String>, Receiver<String>) = channel();
-    let (size, mut io_size, sector_size) = calculate_disk_info(disk_number, io_size);
+    let (size, mut buffer_size, sector_size) = calculate_disk_info(disk_number, buffer_size);
 
     let mut limit = size;
     if args.is_present("limit (GB)") {
@@ -230,13 +230,12 @@ fn main() {
     }
 
     // Reset buffer size if necessary to avoid race conditions during threaded operations
-    if threads * io_size > limit {
-        io_size = calculate_nearest_multiple(PAGE_SIZE, limit / threads);
-        warn!("Reducing I/O operation size to {} bytes to accomodate thread count", io_size);
+    if threads * buffer_size > limit {
+        buffer_size = calculate_nearest_multiple(PAGE_SIZE, limit / threads);
+        warn!("Reducing I/O operation size to {} bytes to accomodate thread count", buffer_size);
     }
     
     info!("Disk {} Information:", disk_number);
-    info!("Size: {} bytes", size);
     for a in 0..id_json.len() {
         let device = &id_json[a];
 
@@ -244,14 +243,21 @@ fn main() {
         let id_str: String = String::from(id.as_str().unwrap());
         let disk_num_str: String = disk_number.to_string();
         if id_str == disk_num_str {
-            info!("Serial Number: {}", &device["SerialNumber"]);
             info!("Friendly Name: {}", &device["FriendlyName"]);
+            info!("Serial Number: {}", &device["SerialNumber"]);
+            info!("Size: {} bytes", size);
             info!("Media Type: {}", &device["MediaType"]);
             break;
         }
-    }
-    info!("Buffer size: {} bytes", io_size);
+    }    
+    info!("Buffer size: {} ({} bytes)", buffer_size_str, buffer_size);
     info!("Thread count: {}", threads);
+
+    if multiple_groups {
+        info!("Program will utilze multiple processor groups");
+    } else {
+        info!("Program will utilize the first processor group only");
+    }
 
     let num_cores = get_core_num();     // CPU cores in the current processor group
     pattern = parse_hex(&pattern_str).unwrap();
@@ -261,16 +267,16 @@ fn main() {
             let processor_groups: Vec<GROUP_AFFINITY> = get_proc_groups().unwrap();
             if multiple_groups {
                 set_thread_group(processor_groups[threads as usize / num_cores]);   // Use multiple processor groups
-                debug!("Thread {} at Group {}, Core {}", threads, processor_groups[threads as usize / num_cores].group, get_thread_affinity().unwrap()[0]);
             } else {
                 set_thread_group(processor_groups[0]);      // Use first group with round robin approach if threads exceed core count
             }
             let affinity: Vec<usize> = vec![(threads % num_cores as u64) as usize; 1];      // Wrap threads around 
             let _ = set_thread_affinity(affinity);      // Pin thread to single CPU core
+            debug!("Thread {} at Group {}, Core {}", threads, processor_groups[threads as usize / num_cores].group, get_thread_affinity().unwrap()[0]);
             if compare_pattern {
-                conduct_data_comparison(sen_clone, num_threads, threads.clone(), disk_number, pattern, limit, sector_size, io_size, iterations);
+                conduct_data_comparison(sen_clone, num_threads, threads.clone(), disk_number, pattern, limit, sector_size, buffer_size, iterations);
             } else {
-                conduct_io_operation(sen_clone, disk_number, num_threads, threads.clone(), io_size, limit, io_type, pattern, iterations);
+                conduct_io_operation(sen_clone, disk_number, num_threads, threads.clone(), buffer_size, limit, io_type, pattern, iterations);
             }
         });
         threads -= 1;
@@ -356,7 +362,7 @@ fn open_handle(path: &str, handle_type: char) -> Result<Foundation::HANDLE, Stri
 }
 
 // Conduct threaded IO operation (read/write)
-fn conduct_io_operation(sender: std::sync::mpsc::Sender<String>, disk_number: u8, num_threads: u64, id: u64, io_size: u64, size: u64, io_type: char, pattern: u64, loops: u64) {
+fn conduct_io_operation(sender: std::sync::mpsc::Sender<String>, disk_number: u8, num_threads: u64, id: u64, buffer_size: u64, size: u64, io_type: char, pattern: u64, loops: u64) {
     let mut initialization_offset = 0;
     if io_type == 'w' {   // Add 4 KB offset to all operations to avoid overwriting drive
         initialization_offset = INITIALIZATION_OFFSET;
@@ -369,7 +375,7 @@ fn conduct_io_operation(sender: std::sync::mpsc::Sender<String>, disk_number: u8
     let mut offset = (id - 1) * local_limit;
 
     // Set up data pattern
-    let pattern_data: Vec<u64> = vec![pattern; io_size as usize / std::mem::size_of::<u64>()];
+    let pattern_data: Vec<u64> = vec![pattern; buffer_size as usize / std::mem::size_of::<u64>()];
 
     // Reset offset if not an even multiple of page size (4k bytes)
     offset = calculate_nearest_multiple(PAGE_SIZE, offset);
@@ -378,7 +384,7 @@ fn conduct_io_operation(sender: std::sync::mpsc::Sender<String>, disk_number: u8
      let buffer: LPVOID = unsafe {
         VirtualAlloc(
             null_mut(),
-            io_size as usize,
+            buffer_size as usize,
             MEM_COMMIT | MEM_RESERVE,
             PAGE_EXECUTE_READWRITE
         )
@@ -399,12 +405,12 @@ fn conduct_io_operation(sender: std::sync::mpsc::Sender<String>, disk_number: u8
         let mut bytes_completed: u32 = 0;
         let bytes_completed_ptr: *mut u32 = &mut bytes_completed;
         let mut pos: u64 = offset;
-        let last_pos: u64 = local_limit * id - io_size;
+        let last_pos: u64 = local_limit * id - buffer_size;
 
         if io_type == 'w' {
             info!("Write mode selected");
             // Set up references for write buffer and copy pattern data into buffer 
-            let write_buffer_ptr_raw: *mut [u64] = std::ptr::slice_from_raw_parts_mut(buffer, io_size as usize / std::mem::size_of::<u64>()) as *mut [u64];
+            let write_buffer_ptr_raw: *mut [u64] = std::ptr::slice_from_raw_parts_mut(buffer, buffer_size as usize / std::mem::size_of::<u64>()) as *mut [u64];
             let write_buf: &mut [u64];
             unsafe {
                 let buf_ptr: *mut [u64] = write_buffer_ptr_raw as *mut [u64];
@@ -417,7 +423,7 @@ fn conduct_io_operation(sender: std::sync::mpsc::Sender<String>, disk_number: u8
                     FileSystem::WriteFile(
                         handle,
                         buffer,
-                        io_size as DWORD,
+                        buffer_size as DWORD,
                         bytes_completed_ptr,
                         null_mut()
                     )
@@ -438,7 +444,7 @@ fn conduct_io_operation(sender: std::sync::mpsc::Sender<String>, disk_number: u8
                     FileSystem::ReadFile(
                         handle,
                         buffer,
-                        io_size as DWORD,
+                        buffer_size as DWORD,
                         bytes_completed_ptr,
                         null_mut()
                     )
@@ -464,7 +470,7 @@ fn conduct_io_operation(sender: std::sync::mpsc::Sender<String>, disk_number: u8
 
 
 // Multithreaded write/compare data patterns
-fn conduct_data_comparison(sender: std::sync::mpsc::Sender<String>, num_threads: u64, id: u64, disk_number: u8, mut original_pattern: u64, size: u64, _sector_size: u64, io_size: u64, loops: u64) {
+fn conduct_data_comparison(sender: std::sync::mpsc::Sender<String>, num_threads: u64, id: u64, disk_number: u8, mut original_pattern: u64, size: u64, _sector_size: u64, buffer_size: u64, loops: u64) {
     let mut pattern = original_pattern;     // For data comparisons
     let local_limit = calculate_nearest_multiple(PAGE_SIZE, size / num_threads);     // Align full IO size
     let path = format_drive_num(disk_number);
@@ -477,20 +483,20 @@ fn conduct_data_comparison(sender: std::sync::mpsc::Sender<String>, num_threads:
     offset = calculate_nearest_multiple(PAGE_SIZE, offset);
 
     // Set up data pattern
-    let mut pattern_data: Vec<u64> = vec![pattern; io_size as usize / std::mem::size_of::<u64>()];
+    let mut pattern_data: Vec<u64> = vec![pattern; buffer_size as usize / std::mem::size_of::<u64>()];
 
     // Allocate sector-aligned buffers with Win32 VirtualAlloc
     let write_buffer: LPVOID = unsafe {
         VirtualAlloc(
             null_mut(),
-            io_size as usize,
+            buffer_size as usize,
             MEM_COMMIT | MEM_RESERVE,
             PAGE_EXECUTE_READWRITE
         )
     };
 
     // Set up references for write buffer and copy pattern data into buffer 
-    let write_buffer_ptr_raw: *mut [u64] = std::ptr::slice_from_raw_parts_mut(write_buffer, io_size as usize / std::mem::size_of::<u64>()) as *mut [u64];
+    let write_buffer_ptr_raw: *mut [u64] = std::ptr::slice_from_raw_parts_mut(write_buffer, buffer_size as usize / std::mem::size_of::<u64>()) as *mut [u64];
     let write_buf: &mut [u64];
     unsafe {
         let buf_ptr: *mut [u64] = write_buffer_ptr_raw as *mut [u64];
@@ -501,7 +507,7 @@ fn conduct_data_comparison(sender: std::sync::mpsc::Sender<String>, num_threads:
     let read_buffer: LPVOID = unsafe {
         VirtualAlloc(
             null_mut(),
-            io_size as usize,
+            buffer_size as usize,
             MEM_COMMIT | MEM_RESERVE,
             PAGE_EXECUTE_READWRITE
         )
@@ -524,7 +530,7 @@ fn conduct_data_comparison(sender: std::sync::mpsc::Sender<String>, num_threads:
         let mut bytes_completed: u32 = 0;
         let bytes_completed_ptr: *mut u32 = &mut bytes_completed;
         let mut pos: u64 = offset;
-        let last_pos: u64 = local_limit * id - io_size;
+        let last_pos: u64 = local_limit * id - buffer_size;
         let mut received: u64;
 
         // Set up raw pointer and reference for read buffer
@@ -539,7 +545,7 @@ fn conduct_data_comparison(sender: std::sync::mpsc::Sender<String>, num_threads:
                 FileSystem::WriteFile(
                     handle,
                     write_buffer,
-                    io_size as DWORD,
+                    buffer_size as DWORD,
                     bytes_completed_ptr,
                     null_mut()
                 )
@@ -559,7 +565,7 @@ fn conduct_data_comparison(sender: std::sync::mpsc::Sender<String>, num_threads:
             // Shift pattern and modify write buffer
             original_pattern = pattern;
             pattern = bit_shift(pattern, 1);
-            pattern_data = vec![pattern; io_size as usize / std::mem::size_of::<u64>()];
+            pattern_data = vec![pattern; buffer_size as usize / std::mem::size_of::<u64>()];
             write_buf.copy_from_slice(&pattern_data);
 
             // Reset position and move pointer back to initial offset to conduct read
@@ -579,14 +585,14 @@ fn conduct_data_comparison(sender: std::sync::mpsc::Sender<String>, num_threads:
                     FileSystem::ReadFile(
                         handle,
                         read_buffer,
-                        io_size as DWORD,
+                        buffer_size as DWORD,
                         bytes_completed_ptr,
                         null_mut()
                     )
                 };
 
                 // Retrieve data from read buffer for comparison
-                read_buffer_ptr_raw = std::ptr::slice_from_raw_parts_mut(read_buffer, io_size as usize / std::mem::size_of::<u64>()) as *mut [u64];
+                read_buffer_ptr_raw = std::ptr::slice_from_raw_parts_mut(read_buffer, buffer_size as usize / std::mem::size_of::<u64>()) as *mut [u64];
                 unsafe {
                     let buf_ptr: *mut [u64] = read_buffer_ptr_raw as *mut [u64];
                     read_buf = &mut *buf_ptr;
@@ -621,7 +627,7 @@ fn conduct_data_comparison(sender: std::sync::mpsc::Sender<String>, num_threads:
                     FileSystem::WriteFile(
                         handle,
                         write_buffer,
-                        io_size as DWORD,
+                        buffer_size as DWORD,
                         bytes_completed_ptr,
                         null_mut()
                     )
@@ -656,8 +662,8 @@ fn calculate_disk_info(disk_number: u8, iosize: u64) -> (u64, u64, u64) {
     let sectors = disk_geometry.sectors();
     let size = disk_geometry.size();
     let sector_size = size / sectors;
-    let io_size = calculate_nearest_multiple(sector_size, iosize);
-    return (size, io_size, sector_size);
+    let buffer_size = calculate_nearest_multiple(sector_size, iosize);
+    return (size, buffer_size, sector_size);
 }
 
 
@@ -741,6 +747,59 @@ fn parse_script(stdout: &str, id_json: &mut JsonValue) {
 
 fn split_char(c: char) -> bool {
     return c == '@' || c == '{' || c == '}';
+}
+
+
+fn get_buffer_size(input: &str) -> u64 {
+    match input {
+        "512b" => {
+            return 512;
+        },
+        "1k" => {
+            return 1024;
+        },
+        "2k" => {
+            return 2048;
+        },
+        "4k" => {
+            return PAGE_SIZE;
+        },
+        "8k" => {
+            return PAGE_SIZE * 2;
+        },
+        "16k" => {
+            return PAGE_SIZE * 4;
+        },
+        "32k" => {
+            return PAGE_SIZE * 8;
+        },
+        "64k" => {
+            return PAGE_SIZE * 16;
+        },
+        "128k" => {
+            return PAGE_SIZE * 32;
+        },
+        "256k" => {
+            return PAGE_SIZE * 64;
+        },
+        "512k" => {
+            return PAGE_SIZE * 128;
+        },
+        "1m" => {
+            return MEGABYTE;
+        },
+        "2m" => {
+            return MEGABYTE * 2;
+        },
+        "4m" => {
+            return MEGABYTE * 4;
+        },
+        &_ => {
+            info!("Unsupported buffer size chosen. Supported buffer sizes: 512b, 1k, 2k, 4k, 8k, 16k, 32k, 64k, 128k, 256k, 512k, 1m, 2m, 4m");
+            return 0;
+        }
+
+    }
 }
 
 

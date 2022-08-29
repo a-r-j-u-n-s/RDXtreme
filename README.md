@@ -44,7 +44,7 @@ This CLI allows you to run multithreaded read/write operations on physical stora
 
 `-p/--pattern` : Data pattern to use for writes/comparisons
 
-`-b/--buffer` : Buffer/IO operation size (in multiples of 4 KB)
+`-b/--buffer` : Buffer/IO operation size (512b, 1k, 2k, 4k, 8k, 16k, 32k, 64k, 128k, 256k, 512k, 1m, 2m, 4m)
 
 `-i/--iterations` : Number of times to conduct I/O operations 
 
@@ -69,7 +69,7 @@ DeviceId FriendlyName         SerialNumber                             MediaType
 `1*[>W 64*[>r,c,w~]]` is the supported data comparison pattern
 
 ```
-./storagetiotool.exe -w 0 -t 64 -p 0123456789abcdef -g 10 -b 4 -i 4 --use-groups --debug
+./storagetiotool.exe -w 0 -t 64 -p 0123456789abcdef -g 10 -b 1m -i 4 --use-groups --debug
 ```
 
-This set of commands will continuously write/read/compare/shift the pa  ttern "0x0123456789abcdef" to the first 10 GB of the TOSHIBA storage device. During the process, any anomalies such as data mismatches or Win32 errors will be printed to the console. With these parameters, the given pattern will be duplicated into a 16 KB buffer which will be continously written, shifted, and read, and compared by 64 concurrent threads. Each write/read will be 16 KB, and the entire operation will repeat itself 4 times. Since this computers has many processor groups, `--use-groups` will slightly increase performance by pinning threads to processor cores across the groups. `--debug` is enabled, so information about the threads' statuses will also be printed to the console.
+This set of commands will continuously write/read/compare/shift the pattern "0x0123456789abcdef" to the first 10 GB of the TOSHIBA storage device. During the process, any anomalies such as data corruptions or Win32 errors will be printed to the console. With these parameters, the given pattern will be duplicated into a 1 MB buffer which will be continously written, shifted, and read, and compared by 64 concurrent threads. Each write/read will be 1 MB, and the entire operation will repeat itself 4 times. Since this computers has many processor groups, `--use-groups` tells the program to spread its threads across multiple processor groups. `--debug` is enabled, so information about the threads' statuses will also be printed to the console.
