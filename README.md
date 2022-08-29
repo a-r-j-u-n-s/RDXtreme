@@ -46,13 +46,13 @@ This CLI allows you to run multithreaded read/write operations on physical stora
 
 `-b/--buffer` : Buffer/IO operation size (in multiples of 4 KB)
 
+`-i/--iterations` : Number of times to conduct I/O operations 
+
 `--use-groups` : Optional flag that allows program to utilize multiple processor groups for increased performance
 
-`--log` : Enables logging
+`--debug` : Print debug information in log output
 
 `--info` : Print information about the machine's physical drives
-
-`-i/--iterations` : Number of times to conduct I/O operations 
 
 ## _**Example Use Case: Data Comparison**_
 
@@ -69,7 +69,7 @@ DeviceId FriendlyName         SerialNumber                             MediaType
 `1*[>W 64*[>r,c,w~]]` is the supported data comparison pattern
 
 ```
-./storagetiotool.exe -w 0 -t 64 -p 0123456789abcdef -g 10 -b 4 -i 4 --use-groups --log
+./storagetiotool.exe -w 0 -t 64 -p 0123456789abcdef -g 10 -b 4 -i 4 --use-groups --debug
 ```
 
-This set of commands will continuously write/read/compare/shift the pa  ttern "0x0123456789abcdef" to the first 10 GB of the TOSHIBA storage device. During the process, any anomalies such as data mismatches or Win32 errors will be printed to the console. With these parameters, the given pattern will be duplicated into a 16 KB buffer which will be continously written, shifted, and read, and compared by 64 concurrent threads. Each write/read will be 16 KB, and the entire operation will repeat itself 4 times. Since this computers has many processor groups, `--use-groups` will slightly increase performance by pinning threads to processor cores across the groups. `--log` is enabled, so information about the threads' status will also be printed to the console.
+This set of commands will continuously write/read/compare/shift the pa  ttern "0x0123456789abcdef" to the first 10 GB of the TOSHIBA storage device. During the process, any anomalies such as data mismatches or Win32 errors will be printed to the console. With these parameters, the given pattern will be duplicated into a 16 KB buffer which will be continously written, shifted, and read, and compared by 64 concurrent threads. Each write/read will be 16 KB, and the entire operation will repeat itself 4 times. Since this computers has many processor groups, `--use-groups` will slightly increase performance by pinning threads to processor cores across the groups. `--debug` is enabled, so information about the threads' statuses will also be printed to the console.

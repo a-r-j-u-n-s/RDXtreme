@@ -78,10 +78,12 @@ fn main() {
             .help("buffer size (in multiples of 4 KB)"))
         .arg(Arg::new("use-groups")
             .long("use-groups")
-            .takes_value(false))
-        .arg(Arg::new("log")
-            .long("log")
-            .takes_value(false))
+            .takes_value(false)
+            .help("Utilize multiple processor groups to increase performance"))
+        .arg(Arg::new("debug")
+            .long("debug")
+            .takes_value(false)
+            .help("Display debug information in log output"))
         .arg(Arg::new("controller")
             .short('c')
             .long("controller")
@@ -105,87 +107,26 @@ fn main() {
     let io_type: char;      // Identifier for opening handle and conducting IO
     let mut log_type: &str = "info";
     let mut iterations: u64 = 1;    // Number of times to run I/O operations
+    let mut id_json: JsonValue = json::JsonValue::new_array();
 
     // Set logging type
-    if args.is_present("log") {
+    if args.is_present("debug") {
         log_type = "debug"
     }
     // Set up logging
     env_logger::init_from_env(
         env_logger::Env::default().filter_or(env_logger::DEFAULT_FILTER_ENV, log_type));
 
-    if args.is_present("iterations") {
-        iterations = args.value_of("iterations").unwrap().parse().expect("Number of iterations must be a positive integer");
-        info!("Program will run {} times", iterations);
-    }
-    
-    if args.is_present("threads") {
-        threads = args.value_of("threads").unwrap().parse().expect("Thread count must be a positive integer");
-    }
-    if args.is_present("use-groups") {
-        multiple_groups = true;
-    }
-    if args.is_present("pattern") {
-        pattern_str = args.value_of("pattern").unwrap().parse().expect("Pattern must be a valid string");
-        compare_pattern = true;
-        info!("Data Comparison mode selected");
-    }
-    if args.is_present("buffer") {
-        let buffer_size: u64 = args.value_of("buffer").unwrap().parse().expect("Buffer size must be a valid integer");
-        if buffer_size > 1024 {
-            error!("Buffer size must not exceed 4 MB, exiting...");
-            exit(1);
-        }
-        io_size = buffer_size * PAGE_SIZE;
-    } else {
-        io_size = MEGABYTE;
-    }
-    if args.is_present("read") {
-        disk_number = args.value_of("read").unwrap().parse().expect("Disk number must be a valid integer");
-        partitions = get_partitions(disk_number);
-        if partitions > 1 {
-            error!("Cannot conduct read IO operations on disk with multiple partitions, exiting...");
-            exit(1);
-        }
-        io_type = 'r';
-        info!("Read mode selected");
-    } else if args.is_present("write") {
-        disk_number = args.value_of("write").unwrap().parse().expect("Disk number must be a valid integer");
-        partitions = get_partitions(disk_number);
-        if partitions > 1 {
-            error!("Cannot conduct write IO operations on disk with multiple partitions, exiting...");
-            exit(1);
-        }
-        io_type = 'w';
-        info!("Write mode selected");
-    } else {
-        // TODO: Get Identify Controller
-        if args.is_present("controller") {
-            disk_number = args.value_of("controller").unwrap().parse().expect("Disk number must be a valid integer!");
-            let path = format_drive_num(disk_number);
-            let handle: Foundation::HANDLE = open_handle(&path, 'r').unwrap();
-            id_controller(handle);
-            return;
+    info!("Begin program");
 
-        // TODO: Get Identify Namespace
-
-        // TODO: Get Firmware Info
-        }
-
-        warn!("Please specify an IO operation (--help for more information)");
-        exit(0);
-    }
-    info!("Data pattern: {}{}", "0x", pattern_str);
-
-    // Print disk information
-    if args.is_present("info") {
-        let get_physicaldisks_script = include_str!("get_physicaldisks.ps1");
-        match powershell_script::run(get_physicaldisks_script) {
-            Ok(output) => {
-                let stdout = String::from(output.stdout().unwrap());
-                let mut id_json = json::JsonValue::new_array();
-		        parse_script(&stdout, &mut id_json);
-                let serialized = json::stringify(id_json);
+    // Get disk information
+    let get_physicaldisks_script = include_str!("get_physicaldisks.ps1");
+    match powershell_script::run(get_physicaldisks_script) {
+        Ok(output) => {
+            let stdout = String::from(output.stdout().unwrap());
+            parse_script(&stdout, &mut id_json);
+            if args.is_present("info") {
+                let serialized = json::stringify(id_json.clone());
                 let mut file = File::create("disk_info.json").expect("Error encountered while creating file!");
                 file.write_all(serialized.as_bytes()).expect("Error writing disk information to file");
                 let ps = powershell_script::PsScriptBuilder::new()
@@ -207,11 +148,72 @@ fn main() {
                 println!("{}", output.stdout().unwrap());
                 let _result = remove_file("./disk_info.json").expect("Encountered error removing temporary JSON file");
             }
-            Err(e) => {
-                println!("Error: {}", e);
-            }
-        } 
+        }
+        Err(e) => {
+            println!("Error: {}", e);
+        }
+    }    
+
+    if args.is_present("read") || args.is_present("write") {
+        if args.is_present("read") {
+            disk_number = args.value_of("read").unwrap().parse().expect("Disk number must be a valid integer");
+            partitions = get_partitions(disk_number);
+            io_type = 'r';
+        } else {
+            disk_number = args.value_of("write").unwrap().parse().expect("Disk number must be a valid integer");
+            partitions = get_partitions(disk_number);
+            io_type = 'w';
+        }
+        if partitions > 1 {
+            error!("Cannot conduct IO operations on disk with multiple partitions, exiting...");
+            exit(1);
+        }
+    } else {
+        // TODO: Get Identify Controller
+        if args.is_present("controller") {
+            disk_number = args.value_of("controller").unwrap().parse().expect("Disk number must be a valid integer!");
+            let path = format_drive_num(disk_number);
+            let handle: Foundation::HANDLE = open_handle(&path, 'r').unwrap();
+            id_controller(handle);
+            return;
+
+        // TODO: Get Identify Namespace
+
+        // TODO: Get Firmware Info
+        }
+        warn!("Please specify an I/O operation (--help for more information)");
+        exit(0);
     }
+
+    if args.is_present("iterations") {
+        iterations = args.value_of("iterations").unwrap().parse().expect("Number of iterations must be a positive integer");
+        info!("Operations will loop {} times", iterations);
+    }
+    
+    if args.is_present("threads") {
+        threads = args.value_of("threads").unwrap().parse().expect("Thread count must be a positive integer");
+    }
+    if args.is_present("use-groups") {
+        multiple_groups = true;
+        info!("Program will attempt to utilize multiple processor groups to increase performance");
+    }
+    if args.is_present("pattern") {
+        pattern_str = args.value_of("pattern").unwrap().parse().expect("Pattern must be a valid string");
+        compare_pattern = true;
+        info!("Any Pattern 64 Bit Moving Inversions with Data Comparison 1*[>W 64*[>r,c,w~]]");
+    }
+    if args.is_present("buffer") {
+        let buffer_size: u64 = args.value_of("buffer").unwrap().parse().expect("Buffer size must be a valid integer");
+        if buffer_size > 1024 {
+            error!("Buffer size must not exceed 4 MB, exiting...");
+            exit(1);
+        }
+        io_size = buffer_size * PAGE_SIZE;
+    } else {
+        io_size = MEGABYTE;
+    }
+
+    info!("Data pattern: {}{}", "0x", pattern_str);
 
     // Threading logic to handle reads/writes
     let num_threads = threads;
@@ -233,7 +235,24 @@ fn main() {
         warn!("Reducing I/O operation size to {} bytes to accomodate thread count", io_size);
     }
     
-    info!("Disk {} size: {} bytes", disk_number, size);
+    info!("Disk {} Information:", disk_number);
+    info!("Size: {} bytes", size);
+    for a in 0..id_json.len() {
+        let device = &id_json[a];
+
+        let id: &JsonValue = &device["DeviceId"];
+        let id_str: String = String::from(id.as_str().unwrap());
+        let disk_num_str: String = disk_number.to_string();
+        if id_str == disk_num_str {
+            info!("Serial Number: {}", &device["SerialNumber"]);
+            info!("Friendly Name: {}", &device["FriendlyName"]);
+            info!("Media Type: {}", &device["MediaType"]);
+            break;
+        }
+    }
+    info!("Buffer size: {} bytes", io_size);
+    info!("Thread count: {}", threads);
+
     let num_cores = get_core_num();     // CPU cores in the current processor group
     pattern = parse_hex(&pattern_str).unwrap();
     while threads != 0 {
@@ -242,7 +261,7 @@ fn main() {
             let processor_groups: Vec<GROUP_AFFINITY> = get_proc_groups().unwrap();
             if multiple_groups {
                 set_thread_group(processor_groups[threads as usize / num_cores]);   // Use multiple processor groups
-                // println!("Thread {} at Group {}, Core {}", threads, processor_groups[threads as usize / num_cores].group, get_thread_affinity().unwrap()[0]);
+                debug!("Thread {} at Group {}, Core {}", threads, processor_groups[threads as usize / num_cores].group, get_thread_affinity().unwrap()[0]);
             } else {
                 set_thread_group(processor_groups[0]);      // Use first group with round robin approach if threads exceed core count
             }
@@ -383,6 +402,7 @@ fn conduct_io_operation(sender: std::sync::mpsc::Sender<String>, disk_number: u8
         let last_pos: u64 = local_limit * id - io_size;
 
         if io_type == 'w' {
+            info!("Write mode selected");
             // Set up references for write buffer and copy pattern data into buffer 
             let write_buffer_ptr_raw: *mut [u64] = std::ptr::slice_from_raw_parts_mut(buffer, io_size as usize / std::mem::size_of::<u64>()) as *mut [u64];
             let write_buf: &mut [u64];
@@ -411,6 +431,7 @@ fn conduct_io_operation(sender: std::sync::mpsc::Sender<String>, disk_number: u8
             let elapsed_time = now.elapsed();
             debug!("Thread {} took {} seconds to finish writing", id, elapsed_time.as_secs());
         } else if io_type == 'r' {
+            info!("Read mode selected");
             let now = Instant::now();
             while pos <= last_pos {
                 let read = unsafe {
@@ -575,7 +596,7 @@ fn conduct_data_comparison(sender: std::sync::mpsc::Sender<String>, num_threads:
                 received = read_buf[0];
                 if received != original_pattern {
                     error!(   
-                        "Data mismatch at thread {} iteration {}! Actual({:#018x}) vs Expected({:#018x})", id, iterations, received, original_pattern
+                        "Data corruption at offset {}! Iteration {}, Thread {}. Actual({:#018x}) vs Expected({:#018x})", pos, iterations, id, received, original_pattern
                     );
                 }
 
