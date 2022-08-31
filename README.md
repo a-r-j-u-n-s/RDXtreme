@@ -27,28 +27,34 @@ This CLI allows you to run multithreaded read/write operations and data comparis
 **This tool must be run with Administrator privileges in PowerShell**
 
 ```
-./storagetiotool.exe -w/-r [disk #] -t [THREADS] -p [PATTERN] -g/-m [LIMIT] -b [SIZE] -i [ITERATIONS] [...]
+./storagetiotool.exe -w/-r -p [disk #] -t [THREADS] -P [PATTERN] -g/-m [LIMIT] -b [SIZE] -i [ITERATIONS] -T [TEST] [...]
 ```
 
 ### Flags
 
-`-r/--read [ID]` : Read
+`-p/--physical-disk` : Physical disk ID to run I/O operations on
 
-`-w/--write [ID]` : Write
+`-r/--read` : Read mode
+
+`-w/--write` : Write mode
 
 `-t/--threads [THREADS]` : Number of threads to use
+
+`-T/--test [ID]` : Test to run (tests defined below)
+
+`-n/--no-compare` : Disable data comparisons for tests
 
 `-g/--limitgb [LIMIT]` : I/O limit (in GB)
 
 `-m/--limitmb [LIMIT]` : I/O limit (in MB)
 
-`-p/--pattern [HEX]` : Data pattern to use for writes/comparisons
+`-P/--pattern [NUM]` : Data pattern to use for writes/comparisons
 
 `-b/--buffer [SIZE]` : Buffer/IO operation size (512b, 1k, 2k, 4k, 8k, 16k, 32k, 64k, 128k, 256k, 512k, 1m, 2m, 4m)
 
-`--time [LENGTH]` : How long (seconds) to run the operation for
+`--time [LENGTH]` : Time limit (s) before program exits
 
-`-i/--iterations [LOOPS]` : Number of times to conduct I/O operations 
+`-i/--iterations [LOOPS]` : Number of times to conduct I/O test 
 
 `--use-groups` : Optional flag that allows program to utilize multiple processor groups for increased performance
 
@@ -57,7 +63,7 @@ This CLI allows you to run multithreaded read/write operations and data comparis
 `--info` : Print information about the machine's physical drives
 
 
-## _**Example Use Case: Data Comparison**_
+## _**Options**_
 
 Output from `./storageiotool.exe --info`:
 
@@ -68,8 +74,7 @@ DeviceId FriendlyName         SerialNumber                             MediaType
 
 ```
 
-### Options
-`1*[>W 64*[>r,c,w~]]` is the supported data comparison pattern
+### Use Case Example
 
 ```
 ./storagetiotool.exe -w 0 -t 64 -p 0123456789abcdef -g 10 -b 1m -i 4 --use-groups --debug

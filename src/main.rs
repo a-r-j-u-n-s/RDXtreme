@@ -12,8 +12,6 @@ use json::{object, JsonValue};
 use std::fs::{File, remove_file};
 use std::io::prelude::*;
 
-// TODO: Use memcpy and comparison to compare rather than just first element
-
 // Sector aligned buffer size constants
 const MEGABYTE: u64 = 1048576;
 const GIGABYTE: u64 = 1073741824;
@@ -22,6 +20,8 @@ const INITIALIZATION_OFFSET: u64 = 4096;
 
 const NVME_MAX_LOG_SIZE: u64 = 0x1000;
 
+// TODO: wrap virtualalloc in struct with drop, better memcpy comparisons
+
 fn main() {
     // Refresh system information so drives are up to date
     let mut sysinfo = sysinfo::System::new_all();
@@ -29,18 +29,23 @@ fn main() {
 
     // CLI arguments
     let args = clap::App::new("Storage IO Test Tool")
-        .version("v1.1.0")
+        .version("v2.0.0")
         .author("Arjun Srivastava, Microsoft CHIE - ASE")
-        .about("CLI to analyze and conduct multithreaded read/write IO operations and data comparisons on single-partition physical disks")
+        .about("CLI to analyze and conduct multithreaded read/write IO operations and data comparison tests on single-partition physical disks")
         .arg(Arg::new("info")
             .long("info")
             .takes_value(false)
-            .help("Print information about physical drives"))
+            .help("Print information about physical drives on your machine"))
+        .arg(Arg::new("physical-disk")
+            .short('p')
+            .long("physical-disk")
+            .takes_value(true)
+            .help("Physical disk ID to run I/O operations on"))
         .arg(Arg::new("write")
             .short('w')
             .long("write")
-            .takes_value(true)
-            .help("Specify physical disk ID to write to"))
+            .takes_value(false)
+            .help("Write mode"))
         .arg(Arg::new("threads")
             .short('t')
             .long("threads")
@@ -49,12 +54,22 @@ fn main() {
         .arg(Arg::new("read")
             .short('r')
             .long("read")
-            .takes_value(true)
-            .help("Specify physical disk ID to read from"))
+            .takes_value(false)
+            .help("Read only mode"))
         .arg(Arg::new("time")
             .long("time")
             .takes_value(true)
-            .help("Time (s) to run I/O test "))    
+            .help("Time (s) to run I/O test"))
+        .arg(Arg::new("test")
+            .long("test")
+            .short('T')
+            .takes_value(true)
+            .help("Test case to run\nOptions:\n0. Any Pattern Full Write No Comparison 1*[>W] (default)\n1. Any Pattern 64 Bit Moving Inversions with Data Comparison 1*[>W 64*[>r,c,w~]]\n2. Any Pattern 64 Bit with Data Comparison 1*[>W 64*[>r,c]]"))
+        .arg(Arg::new("no-compare")
+            .short('n')
+            .long("no-compare")
+            .takes_value(true)
+            .help("Disable data comparisons for tests"))
         .arg(Arg::new("limit (GB)")
             .short('g')
             .long("limitgb")
@@ -66,7 +81,7 @@ fn main() {
             .takes_value(true)
             .help("Limit (in MB) I/O size for read/write operation"))
         .arg(Arg::new("pattern")
-            .short('p')
+            .short('P')
             .long("pattern")
             .takes_value(true)
             .help("Data pattern to write to drive"))
@@ -79,7 +94,7 @@ fn main() {
             .short('b')
             .long("buffer")
             .takes_value(true)
-            .help("buffer size (in multiples of 4 KB)"))
+            .help("Buffer size\nSupported sizes (bytes): 512b, 1k, 2k, 4k, 8k, 16k, 32k, 64k, 128k, 256k, 512k, 1m, 2m, 4m"))
         .arg(Arg::new("use-groups")
             .long("use-groups")
             .takes_value(false)
@@ -93,17 +108,12 @@ fn main() {
             .long("controller")
             .takes_value(true)
             .help("Display controller information for NVMe device"))
-        .arg(Arg::new("namespace")
-            .short('n')
-            .long("namespace")
-            .takes_value(true)
-            .help("Display namespace information for NVMe device"))
         .get_matches();
 
     let partitions: u8;
     let mut pattern_str: String = String::from("0123456789abcdef");     // Default 64-bit pattern for conducting I/O data comparisons
     let pattern: u64;
-    let mut compare_pattern: bool = false;
+    let mut compare_pattern: bool = true;
     let disk_number: u8;
     let mut buffer_size: u64 = MEGABYTE;    // Defaulyt buffer size
     let mut buffer_size_str: &str = "1m";
@@ -114,6 +124,7 @@ fn main() {
     let mut iterations: u64 = 1;    // Number of times to run I/O operations
     let mut id_json: JsonValue = json::JsonValue::new_array();
     let mut time: u64 = 0;
+    let test: u8;
 
     // Set logging type
     if args.is_present("debug") {
@@ -160,33 +171,23 @@ fn main() {
         }
     }    
 
-    if args.is_present("read") || args.is_present("write") {
-        if args.is_present("read") {
-            disk_number = args.value_of("read").unwrap().parse().expect("Disk number must be a valid integer");
-            partitions = get_partitions(disk_number);
-            io_type = 'r';
-        } else {
-            disk_number = args.value_of("write").unwrap().parse().expect("Disk number must be a valid integer");
-            partitions = get_partitions(disk_number);
-            io_type = 'w';
-        }
+    if args.is_present("physical-disk") {
+        disk_number = args.value_of("physical-disk").unwrap().parse().expect("Disk number must be a valid integer");
+        partitions = get_partitions(disk_number);
         if partitions > 1 {
             error!("Cannot conduct IO operations on disk with multiple partitions, exiting...");
             exit(1);
         }
     } else {
-        // TODO: Get Identify Controller
-        if args.is_present("controller") {
-            disk_number = args.value_of("controller").unwrap().parse().expect("Disk number must be a valid integer!");
-            let path = format_drive_num(disk_number);
-            let handle: Foundation::HANDLE = open_handle(&path, 'r').unwrap();
-            id_controller(handle);
-            return;
+        warn!("Must select a physical disk ID to conduct I/O operations. (--info for a list of your disks)");
+        exit(0);
+    }
 
-        // TODO: Get Identify Namespace
-
-        // TODO: Get Firmware Info
-        }
+    if args.is_present("read") {
+        io_type = 'r';
+    } else if args.is_present("write") {
+        io_type = 'w';
+    } else {
         warn!("Please specify an I/O operation (--help for more information)");
         exit(0);
     }
@@ -204,8 +205,6 @@ fn main() {
     }
     if args.is_present("pattern") {
         pattern_str = args.value_of("pattern").unwrap().parse().expect("Pattern must be a valid string");
-        compare_pattern = true;
-        info!("Any Pattern 64 Bit Moving Inversions with Data Comparison 1*[>W 64*[>r,c,w~]]");
     }
     if args.is_present("buffer") {
         buffer_size_str = args.value_of("buffer").unwrap();
@@ -214,8 +213,17 @@ fn main() {
             exit(1);
         }
     }
-
     info!("Data pattern: {}{}", "0x", pattern_str);
+    if args.is_present("test") {
+        test = args.value_of("test").unwrap().parse().expect("Test ID must be a valid integer");
+    } else {
+        test = 0;
+    }
+    select_test_type(test);
+    if args.is_present("no-compare") {
+        compare_pattern = false;
+        info!("Data comparisons disabled");
+    }    
 
     // Threading logic to handle reads/writes
     let num_threads = threads;
@@ -230,6 +238,9 @@ fn main() {
         limit = args.value_of("limit (MB)").unwrap().parse().expect("I/O GB limit must be a valid integer");
         limit *= MEGABYTE;
     }
+    if limit > size {
+        warn!("Requested limit is too large, truncating to the full size of the drive ({} bytes)", size);
+    }
 
     // Reset buffer size if necessary to avoid race conditions during threaded operations
     if threads * buffer_size > limit {
@@ -239,7 +250,7 @@ fn main() {
     
     info!("Disk {} Information:", disk_number);
     for a in 0..id_json.len() {
-        let device = &id_json[a];
+        let device: &JsonValue = &id_json[a];
 
         let id: &JsonValue = &device["DeviceId"];
         let id_str: String = String::from(id.as_str().unwrap());
@@ -279,10 +290,12 @@ fn main() {
             let affinity: Vec<usize> = vec![(threads % num_cores as u64) as usize; 1];      // Wrap threads around 
             let _ = set_thread_affinity(affinity);      // Pin thread to single CPU core
             debug!("Thread {} at Group {}, Core {}", threads, processor_groups[threads as usize / num_cores].group, get_thread_affinity().unwrap()[0]);
-            if compare_pattern {
-                conduct_data_comparison(sen_clone, num_threads, threads.clone(), disk_number, pattern, limit, sector_size, buffer_size, iterations, time);
-            } else {
+            
+            // Run chosen I/O operation
+            if test == 0 || (test == 1 && !compare_pattern){
                 conduct_io_operation(sen_clone, disk_number, num_threads, threads.clone(), buffer_size, limit, io_type, pattern, iterations, time);
+            } else {
+                conduct_data_comparison(sen_clone, num_threads, threads.clone(), disk_number, pattern, limit, sector_size, buffer_size, iterations, time, test, compare_pattern);
             }
         });
         threads -= 1;
@@ -300,14 +313,14 @@ fn main() {
                 debug!("[Thread {}]: Status: {}", isplit.clone().last().unwrap(), isplit.clone().next().unwrap());
                 threads_clone -= 1;
                 if threads_clone == 0 {
-                    info!("{}", "All pending I/O operations finished");
+                    info!("All pending I/O operations finished");
                     break;
                 }
             }
         }
     });
     receiver_thread.join().unwrap();
-    info!("{}", "All pending I/O operations finished");
+    info!("All pending I/O operations finished");
 }
 
 
@@ -488,7 +501,7 @@ fn conduct_io_operation(sender: std::sync::mpsc::Sender<String>, disk_number: u8
 
 
 // Multithreaded write/compare data patterns
-fn conduct_data_comparison(sender: std::sync::mpsc::Sender<String>, num_threads: u64, id: u64, disk_number: u8, mut original_pattern: u64, size: u64, _sector_size: u64, buffer_size: u64, loops: u64, time: u64) {
+fn conduct_data_comparison(sender: std::sync::mpsc::Sender<String>, num_threads: u64, id: u64, disk_number: u8, mut original_pattern: u64, size: u64, _sector_size: u64, buffer_size: u64, loops: u64, time: u64, test: u8, compare_pattern: bool) {
     let mut pattern = original_pattern;     // For data comparisons
     let local_limit = calculate_nearest_multiple(PAGE_SIZE, size / num_threads);     // Align full IO size
     let path = format_drive_num(disk_number);
@@ -581,16 +594,23 @@ fn conduct_data_comparison(sender: std::sync::mpsc::Sender<String>, num_threads:
                 }
             }
         }
-        let mut iterations = 0;
-
+        let mut iterations: u8 = 0;
+        let runs: u8;
+        if test == 1 {
+            runs = 64;
+        } else {
+            runs = 1;
+        }
+    
         // 64 iterations to allow complete bit shift
-        while iterations < 64 {
-            // Shift pattern and modify write buffer
-            original_pattern = pattern;
-            pattern = bit_shift(pattern, 1);
-            pattern_data = vec![pattern; buffer_size as usize / std::mem::size_of::<u64>()];
-            write_buf.copy_from_slice(&pattern_data);
-
+        while iterations < runs {
+            if test == 1 {      // Shift pattern and modify write buffer
+                original_pattern = pattern;
+                pattern = bit_shift(pattern, 1);
+                pattern_data = vec![pattern; buffer_size as usize / std::mem::size_of::<u64>()];
+                write_buf.copy_from_slice(&pattern_data);
+            }
+            
             // Reset position and move pointer back to initial offset to conduct read
             pos = offset;
             _pointer = unsafe {
@@ -614,19 +634,22 @@ fn conduct_data_comparison(sender: std::sync::mpsc::Sender<String>, num_threads:
                     )
                 };
 
-                // Retrieve data from read buffer for comparison
-                read_buffer_ptr_raw = std::ptr::slice_from_raw_parts_mut(read_buffer, buffer_size as usize / std::mem::size_of::<u64>()) as *mut [u64];
-                unsafe {
-                    let buf_ptr: *mut [u64] = read_buffer_ptr_raw as *mut [u64];
-                    read_buf = &mut *buf_ptr;
-                }
+                if compare_pattern {
+                    // Retrieve data from read buffer for comparison
+                    read_buffer_ptr_raw = std::ptr::slice_from_raw_parts_mut(read_buffer, buffer_size as usize / std::mem::size_of::<u64>()) as *mut [u64];
+                    unsafe {
+                        let buf_ptr: *mut [u64] = read_buffer_ptr_raw as *mut [u64];
+                        read_buf = &mut *buf_ptr;
+                    }
 
-                // Compare read buffer to pattern
-                received = read_buf[0];
-                if received != original_pattern {
-                    error!(   
-                        "Data corruption at offset {}! Iteration {}, Thread {}. Actual({:#018x}) vs Expected({:#018x})", pos, iterations, id, received, original_pattern
-                    );
+                    // Compare read buffer to pattern
+                    received = read_buf[0];
+                    if received != original_pattern {
+                        error!(   
+                            "Data corruption at offset {}! Iteration {}, Thread {}. Actual({:#018x}) vs Expected({:#018x})", pos, iterations, id, received, original_pattern
+                        );
+                    }
+                    
                 }
 
                 pos += bytes_completed as u64;
@@ -636,30 +659,32 @@ fn conduct_data_comparison(sender: std::sync::mpsc::Sender<String>, num_threads:
                 }
                 
 
-                // Move pointer back to conduct read
-                _pointer = unsafe {
-                    FileSystem::SetFilePointerEx(
-                        handle,
-                        (bytes_completed as i64 * -1) as i64,
-                        null_mut(),
-                        FileSystem::FILE_CURRENT
-                    )
-                };
+                if test == 1 {
+                    // Move pointer back to conduct write
+                    _pointer = unsafe {
+                        FileSystem::SetFilePointerEx(
+                            handle,
+                            (bytes_completed as i64 * -1) as i64,
+                            null_mut(),
+                            FileSystem::FILE_CURRENT
+                        )
+                    };
 
-                // Write shifted pattern to same LBA
-                let write = unsafe {
-                    FileSystem::WriteFile(
-                        handle,
-                        write_buffer,
-                        buffer_size as DWORD,
-                        bytes_completed_ptr,
-                        null_mut()
-                    )
-                };
+                    // Write shifted pattern to same LBA
+                    let write = unsafe {
+                        FileSystem::WriteFile(
+                            handle,
+                            write_buffer,
+                            buffer_size as DWORD,
+                            bytes_completed_ptr,
+                            null_mut()
+                        )
+                    };
 
-                if write == false {
-                    error!("Thread {} encountered Error Code {}", id, win32::last_error());
-                    break;
+                    if write == false {
+                        error!("Thread {} encountered Error Code {}", id, win32::last_error());
+                        break;
+                    }
                 }
                 if time > 0 {
                     if now.elapsed().as_secs() > time {
@@ -831,13 +856,30 @@ fn get_buffer_size(input: &str) -> u64 {
             return MEGABYTE * 4;
         },
         &_ => {
-            info!("Unsupported buffer size chosen. Supported buffer sizes: 512b, 1k, 2k, 4k, 8k, 16k, 32k, 64k, 128k, 256k, 512k, 1m, 2m, 4m");
+            error!("Unsupported buffer size chosen. Supported buffer sizes: 512b, 1k, 2k, 4k, 8k, 16k, 32k, 64k, 128k, 256k, 512k, 1m, 2m, 4m");
             return 0;
         }
 
     }
 }
 
+
+fn select_test_type(id: u8) {
+    match id {
+        0 => {
+            info!("Default Test: Any Pattern Full Write No Comparison 1*[>W]");
+        },
+        1 => {
+            info!("Test: Any Pattern 64 Bit Moving Inversions with Data Comparison 1*[>W 64*[>r,c,w~]]");
+        },
+        2 => {
+            info!("Test: Any Pattern 64 Bit Moving Inversions with Data Comparison 1*[>W [>r,c]]");
+        },
+        _ => {
+            info!("Test ID does not exist, defaulting to write only mode...");
+        }
+    }
+}
 
 // Adapted from Andrew Adriance's Mempoke
 #[repr(C)]
