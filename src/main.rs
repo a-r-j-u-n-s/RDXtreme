@@ -51,6 +51,10 @@ fn main() {
             .long("read")
             .takes_value(true)
             .help("Specify physical disk ID to read from"))
+        .arg(Arg::new("time")
+            .long("time")
+            .takes_value(true)
+            .help("Time (s) to run I/O test "))    
         .arg(Arg::new("limit (GB)")
             .short('g')
             .long("limitgb")
@@ -101,7 +105,7 @@ fn main() {
     let pattern: u64;
     let mut compare_pattern: bool = false;
     let disk_number: u8;
-    let buffer_size: u64;
+    let mut buffer_size: u64 = MEGABYTE;    // Defaulyt buffer size
     let mut buffer_size_str: &str = "1m";
     let mut threads: u64 = 1;
     let mut multiple_groups: bool = false;
@@ -109,6 +113,7 @@ fn main() {
     let mut log_type: &str = "info";
     let mut iterations: u64 = 1;    // Number of times to run I/O operations
     let mut id_json: JsonValue = json::JsonValue::new_array();
+    let mut time: u64 = 0;
 
     // Set logging type
     if args.is_present("debug") {
@@ -208,9 +213,6 @@ fn main() {
         if buffer_size == 0 {
             exit(1);
         }
-        // buffer_size = buffer_size * PAGE_SIZE;
-    } else {
-        buffer_size = MEGABYTE;
     }
 
     info!("Data pattern: {}{}", "0x", pattern_str);
@@ -258,6 +260,10 @@ fn main() {
     } else {
         info!("Program will utilize the first processor group only");
     }
+    if args.is_present("time") {
+        time = args.value_of("time").unwrap().parse().expect("time must be a valid integer");
+        info!("Program will stop after {} seconds", time);
+    }
 
     let num_cores = get_core_num();     // CPU cores in the current processor group
     pattern = parse_hex(&pattern_str).unwrap();
@@ -274,9 +280,9 @@ fn main() {
             let _ = set_thread_affinity(affinity);      // Pin thread to single CPU core
             debug!("Thread {} at Group {}, Core {}", threads, processor_groups[threads as usize / num_cores].group, get_thread_affinity().unwrap()[0]);
             if compare_pattern {
-                conduct_data_comparison(sen_clone, num_threads, threads.clone(), disk_number, pattern, limit, sector_size, buffer_size, iterations);
+                conduct_data_comparison(sen_clone, num_threads, threads.clone(), disk_number, pattern, limit, sector_size, buffer_size, iterations, time);
             } else {
-                conduct_io_operation(sen_clone, disk_number, num_threads, threads.clone(), buffer_size, limit, io_type, pattern, iterations);
+                conduct_io_operation(sen_clone, disk_number, num_threads, threads.clone(), buffer_size, limit, io_type, pattern, iterations, time);
             }
         });
         threads -= 1;
@@ -362,7 +368,7 @@ fn open_handle(path: &str, handle_type: char) -> Result<Foundation::HANDLE, Stri
 }
 
 // Conduct threaded IO operation (read/write)
-fn conduct_io_operation(sender: std::sync::mpsc::Sender<String>, disk_number: u8, num_threads: u64, id: u64, buffer_size: u64, size: u64, io_type: char, pattern: u64, loops: u64) {
+fn conduct_io_operation(sender: std::sync::mpsc::Sender<String>, disk_number: u8, num_threads: u64, id: u64, buffer_size: u64, size: u64, io_type: char, pattern: u64, loops: u64, time: u64) {
     let mut initialization_offset = 0;
     if io_type == 'w' {   // Add 4 KB offset to all operations to avoid overwriting drive
         initialization_offset = INITIALIZATION_OFFSET;
@@ -370,6 +376,8 @@ fn conduct_io_operation(sender: std::sync::mpsc::Sender<String>, disk_number: u8
     let local_limit = calculate_nearest_multiple(PAGE_SIZE, size / num_threads);     // Align full IO size
     let path: String = format_drive_num(disk_number);
     let handle: Foundation::HANDLE = open_handle(&path, io_type).unwrap();
+    let mut now: Instant;
+    let mut elapsed_time;
 
     // Set up FilePointer to start at offset based on thread number
     let mut offset = (id - 1) * local_limit;
@@ -417,7 +425,7 @@ fn conduct_io_operation(sender: std::sync::mpsc::Sender<String>, disk_number: u8
                 write_buf = &mut *buf_ptr;
                 write_buf.copy_from_slice(&pattern_data);
             }
-            let now = Instant::now();
+            now = Instant::now();
             while pos <= last_pos {
                 let write = unsafe {
                     FileSystem::WriteFile(
@@ -433,12 +441,17 @@ fn conduct_io_operation(sender: std::sync::mpsc::Sender<String>, disk_number: u8
                     error!("Thread {} encountered Error Code {}", id, win32::last_error());
                     break;
                 }
+                if time > 0 {
+                    if now.elapsed().as_secs() > time {
+                        break;
+                    }
+                }
         }
-            let elapsed_time = now.elapsed();
+            elapsed_time = now.elapsed();
             debug!("Thread {} took {} seconds to finish writing", id, elapsed_time.as_secs());
         } else if io_type == 'r' {
             info!("Read mode selected");
-            let now = Instant::now();
+            now = Instant::now();
             while pos <= last_pos {
                 let read = unsafe {
                     FileSystem::ReadFile(
@@ -454,8 +467,13 @@ fn conduct_io_operation(sender: std::sync::mpsc::Sender<String>, disk_number: u8
                     error!("Thread {} encountered Error Code {}", id, win32::last_error());
                     break;
                 }
+                if time > 0 {
+                    if now.elapsed().as_secs() > time {
+                        break;
+                    }
+                }
             }
-            let elapsed_time = now.elapsed();
+            elapsed_time = now.elapsed();
             debug!("Thread {} took {} seconds to finish reading", id, elapsed_time.as_secs());
         }
         i += 1;
@@ -470,7 +488,7 @@ fn conduct_io_operation(sender: std::sync::mpsc::Sender<String>, disk_number: u8
 
 
 // Multithreaded write/compare data patterns
-fn conduct_data_comparison(sender: std::sync::mpsc::Sender<String>, num_threads: u64, id: u64, disk_number: u8, mut original_pattern: u64, size: u64, _sector_size: u64, buffer_size: u64, loops: u64) {
+fn conduct_data_comparison(sender: std::sync::mpsc::Sender<String>, num_threads: u64, id: u64, disk_number: u8, mut original_pattern: u64, size: u64, _sector_size: u64, buffer_size: u64, loops: u64, time: u64) {
     let mut pattern = original_pattern;     // For data comparisons
     let local_limit = calculate_nearest_multiple(PAGE_SIZE, size / num_threads);     // Align full IO size
     let path = format_drive_num(disk_number);
@@ -557,6 +575,11 @@ fn conduct_data_comparison(sender: std::sync::mpsc::Sender<String>, num_threads:
                 error!("Thread {} encountered Error Code {}", id, win32::last_error());
                 break;
             }
+            if time > 0 {
+                if now.elapsed().as_secs() > time {
+                    break;
+                }
+            }
         }
         let mut iterations = 0;
 
@@ -611,6 +634,7 @@ fn conduct_data_comparison(sender: std::sync::mpsc::Sender<String>, num_threads:
                     error!("Thread {} encountered Error Code {}", id, win32::last_error());
                     break;
                 }
+                
 
                 // Move pointer back to conduct read
                 _pointer = unsafe {
@@ -637,10 +661,25 @@ fn conduct_data_comparison(sender: std::sync::mpsc::Sender<String>, num_threads:
                     error!("Thread {} encountered Error Code {}", id, win32::last_error());
                     break;
                 }
+                if time > 0 {
+                    if now.elapsed().as_secs() > time {
+                        break;
+                    }
+                }
             }
             iterations += 1;
+            if time > 0 {
+                if now.elapsed().as_secs() > time {
+                    break;
+                }
+            }
         }
         i += 1;
+        if time > 0 {
+            if now.elapsed().as_secs() > time {
+                break;
+            }
+        }
     }
     let elapsed_time = now.elapsed();
     debug!("Thread {} took {} seconds to finish", id, elapsed_time.as_secs());
@@ -689,9 +728,6 @@ fn bit_shift(data: u64, iterations: u64) -> u64 {
     let bit_count = rotation * 4;
     data.rotate_right(bit_count.try_into().unwrap())
 }
-
-
-
 
 fn parse_hex(src: &str) -> Result<u64, ParseIntError> {
     u64::from_str_radix(src, 16)

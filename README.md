@@ -15,12 +15,12 @@ This CLI allows you to run multithreaded read/write operations on physical stora
 [PowerShell](https://docs.microsoft.com/en-us/powershell/scripting/install/installing-powershell?view=powershell-7.2)
 
 
-## _**Setup**_
+## _**Setup for Development**_
 
 1. `git clone` or download this repository
 2. `cargo install` to install libraries and crates
 3. `cargo build --release` to compile and build .exe
-4. `cargo run -- [FLAGS]` or run exe directly in `target/release/unbuffered_io.exe [FLAGS]`
+4. `cargo run -- [FLAGS]` or run exe directly in `target/release/storageiotool.exe [FLAGS]`
 
 ## _**Usage**_
 
@@ -32,27 +32,30 @@ This CLI allows you to run multithreaded read/write operations on physical stora
 
 ### Flags
 
-`-r/--read` : Read
+`-r/--read [ID]` : Read
 
-`-w/--write`] : Write
+`-w/--write [ID]` : Write
 
-`-t/--threads` : Number of threads to use
+`-t/--threads [THREADS]` : Number of threads to use
 
-`-g/--limitgb` : I/O limit (in GB)
+`-g/--limitgb [LIMIT]` : I/O limit (in GB)
 
-`-m/--limitmb` : I/O limit (in MB)
+`-m/--limitmb [LIMIT]` : I/O limit (in MB)
 
-`-p/--pattern` : Data pattern to use for writes/comparisons
+`-p/--pattern [HEX]` : Data pattern to use for writes/comparisons
 
-`-b/--buffer` : Buffer/IO operation size (512b, 1k, 2k, 4k, 8k, 16k, 32k, 64k, 128k, 256k, 512k, 1m, 2m, 4m)
+`-b/--buffer [SIZE]` : Buffer/IO operation size (512b, 1k, 2k, 4k, 8k, 16k, 32k, 64k, 128k, 256k, 512k, 1m, 2m, 4m)
 
-`-i/--iterations` : Number of times to conduct I/O operations 
+`--time [LENGTH]` : How long (seconds) to run the operation for
+
+`-i/--iterations [LOOPS]` : Number of times to conduct I/O operations 
 
 `--use-groups` : Optional flag that allows program to utilize multiple processor groups for increased performance
 
 `--debug` : Print debug information in log output
 
 `--info` : Print information about the machine's physical drives
+
 
 ## _**Example Use Case: Data Comparison**_
 
