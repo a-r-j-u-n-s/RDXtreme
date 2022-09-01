@@ -20,6 +20,7 @@ This CLI allows you to run multithreaded read/write operations and data comparis
 1. `git clone` or download this repository
 2. `cargo install` to install libraries and crates
 3. `cargo build --release` to compile and build .exe
+    - `cargo build --target=aarch64-pc-windows-msvc` for ARM64
 4. `cargo run -- [FLAGS]` or run exe directly in `target/release/storageiotool.exe [FLAGS]`
 
 ## _**Usage**_
@@ -34,13 +35,13 @@ This CLI allows you to run multithreaded read/write operations and data comparis
 
 `-p/--physical-disk` : Physical disk ID to run I/O operations on
 
-`-r/--read` : Read mode
+`-r/--read` : Read/compare mode
 
 `-w/--write` : Write mode
 
-`-t/--threads [THREADS]` : Number of threads to use
-
 `-T/--test [ID]` : Test to run (tests defined below)
+
+`-t/--threads [THREADS]` : Number of threads to use
 
 `-n/--no-compare` : Disable data comparisons for tests
 
@@ -63,21 +64,34 @@ This CLI allows you to run multithreaded read/write operations and data comparis
 `--info` : Print information about the machine's physical drives
 
 
-## _**Options**_
+## _**Use Cases**_
 
 Output from `./storageiotool.exe --info`:
 
 ```
 DeviceId FriendlyName         SerialNumber                             MediaType Partitions Sector Size
 -------- ------------         ------------                             --------- ---------- -----------
-0        KXG60PNV2T04 TOSHIBA 0000_0000_0000_0001_8CE3_8E05_0088_2698. SSD                4         512
+0        Msft Virtual Disk    N/A                                      Unspecified        3         512
+1        KXG60PNV2T04 TOSHIBA 0000_0000_0000_0001_8CE3_8E05_0088_2698. SSD                1         512
 
 ```
 
-### Use Case Example
-
+### **Initializing SSDs to Steady State:**
 ```
-./storagetiotool.exe -w 0 -t 64 -p 0123456789abcdef -g 10 -b 1m -i 4 --use-groups --debug
+./storageiotool.exe --physical-disk 1 --threads 64 --iterations 2 --buffer 4m --test 2 --use-groups --no-compare
 ```
+- Write/read test runs 2 times with a large buffer size and multiple threads. Comparisons disabled for maximum performance
 
-This set of commands will continuously write/read/compare/shift the pattern "0x0123456789abcdef" to the first 10 GB of the TOSHIBA storage device. During the process, any anomalies such as data corruptions or Win32 errors will be printed to the console. With these parameters, the given pattern will be duplicated into a 1 MB buffer which will be continously written, shifted, and read, and compared by 64 concurrent threads. Each write/read will be 1 MB, and the entire operation will repeat itself 4 times. Since this computers has many processor groups, `--use-groups` tells the program to spread its threads across multiple processor groups. `--debug` is enabled, so information about the threads' statuses will also be printed to the console.
+
+### **Stress-Test Drives:**
+```
+./storageiotool.exe --physical-disk 1 --threads 128 --iterations 5 --pattern 0123456789abcdef --buffer 128k --test 1 --no-compare
+```
+- Moving inversions data comparison test runs 100 times with many threads and a medium-sized buffer without comparisons
+
+
+### **Find Hardware Deficiencies:**
+```
+./storageiotool.exe --physical-disk 1 --threads 32 --iterations 10 --pattern aaaaaaaaaaaaaaa9 --buffer 16k --test 2 --debug --use-groups
+```
+- Read/compare test with a small buffer size and log debug information 

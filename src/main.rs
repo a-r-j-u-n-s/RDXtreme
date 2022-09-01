@@ -20,7 +20,15 @@ const INITIALIZATION_OFFSET: u64 = 4096;
 
 const NVME_MAX_LOG_SIZE: u64 = 0x1000;
 
-// TODO: wrap virtualalloc in struct with drop, better memcpy comparisons
+// Test Type
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum Test {
+    WriteOnly,
+    MovingInversions,
+    ReadCompare
+}
+
+// TODO: wrap virtualalloc in struct with drop, better memcpy comparisons, GET RID OF WRITEONLY DEFAULT
 
 fn main() {
     // Refresh system information so drives are up to date
@@ -55,7 +63,7 @@ fn main() {
             .short('r')
             .long("read")
             .takes_value(false)
-            .help("Read only mode"))
+            .help("Read/compare mode"))
         .arg(Arg::new("time")
             .long("time")
             .takes_value(true)
@@ -64,11 +72,11 @@ fn main() {
             .long("test")
             .short('T')
             .takes_value(true)
-            .help("Test case to run\nOptions:\n0. Any Pattern Full Write No Comparison 1*[>W] (default)\n1. Any Pattern 64 Bit Moving Inversions with Data Comparison 1*[>W 64*[>r,c,w~]]\n2. Any Pattern 64 Bit with Data Comparison 1*[>W 64*[>r,c]]"))
+            .help("Test case to run\nOptions:\n0. Any Pattern Full Write No Comparison Iterations*[>W] (default)\n1. Any Pattern 64 Bit Write Moving Inversions with Data Comparison i*[>W 64*[>r,c,w~]]\n2. Any Pattern 64 Bit Write with Data Comparison [>W i*[>r,c]]"))
         .arg(Arg::new("no-compare")
             .short('n')
             .long("no-compare")
-            .takes_value(true)
+            .takes_value(false)
             .help("Disable data comparisons for tests"))
         .arg(Arg::new("limit (GB)")
             .short('g')
@@ -94,7 +102,7 @@ fn main() {
             .short('b')
             .long("buffer")
             .takes_value(true)
-            .help("Buffer size\nSupported sizes (bytes): 512b, 1k, 2k, 4k, 8k, 16k, 32k, 64k, 128k, 256k, 512k, 1m, 2m, 4m"))
+            .help("Buffer size\nSupported sizes: 512b, 1k, 2k, 4k, 8k, 16k, 32k, 64k, 128k, 256k, 512k, 1m, 2m, 4m"))
         .arg(Arg::new("use-groups")
             .long("use-groups")
             .takes_value(false)
@@ -124,7 +132,9 @@ fn main() {
     let mut iterations: u64 = 1;    // Number of times to run I/O operations
     let mut id_json: JsonValue = json::JsonValue::new_array();
     let mut time: u64 = 0;
-    let test: u8;
+    let mut test: Test = Test::WriteOnly;
+
+
 
     // Set logging type
     if args.is_present("debug") {
@@ -162,12 +172,12 @@ fn main() {
                     $Table = $DiskInfo | Format-Table 'DeviceId', 'FriendlyName', 'SerialNumber', 'MediaType', 'Partitions', 'Sector Size'
                     Write-Output $Table
                 "#).unwrap();
-                println!("{}", output.stdout().unwrap());
-                let _result = remove_file("./disk_info.json").expect("Encountered error removing temporary JSON file");
+                println!("Physical Drive Information:\n{}", output.stdout().unwrap());
+                let _result = remove_file("./disk_info.json").expect("Encountered error removing temporary JSON file for Disk Info");
             }
         }
         Err(e) => {
-            println!("Error: {}", e);
+            error!("Error: {}", e);
         }
     }    
 
@@ -184,11 +194,17 @@ fn main() {
     }
 
     if args.is_present("read") {
-        io_type = 'r';
+        io_type = 'r';      // Read
+        warn!("Read/compare mode, all write operations will be canceled");
     } else if args.is_present("write") {
-        io_type = 'w';
+        info!("Write mode");
+        io_type = 'w';      // Write
+    } else if args.is_present("test") {
+        let id: u8 = args.value_of("test").unwrap().parse().expect("Test ID must be a valid integer");
+        test = select_test_type(id);
+        io_type = 't';      // Test
     } else {
-        warn!("Please specify an I/O operation (--help for more information)");
+        warn!("Please specify an I/O operation OR test case (--help for more information)");
         exit(0);
     }
 
@@ -205,6 +221,10 @@ fn main() {
     }
     if args.is_present("pattern") {
         pattern_str = args.value_of("pattern").unwrap().parse().expect("Pattern must be a valid string");
+        if pattern_str.len() > 16 {
+            error!("Hexadecimal pattern must be 64-bit or smaller!");
+            exit(1);
+        }
     }
     if args.is_present("buffer") {
         buffer_size_str = args.value_of("buffer").unwrap();
@@ -214,12 +234,7 @@ fn main() {
         }
     }
     info!("Data pattern: {}{}", "0x", pattern_str);
-    if args.is_present("test") {
-        test = args.value_of("test").unwrap().parse().expect("Test ID must be a valid integer");
-    } else {
-        test = 0;
-    }
-    select_test_type(test);
+    
     if args.is_present("no-compare") {
         compare_pattern = false;
         info!("Data comparisons disabled");
@@ -292,10 +307,10 @@ fn main() {
             debug!("Thread {} at Group {}, Core {}", threads, processor_groups[threads as usize / num_cores].group, get_thread_affinity().unwrap()[0]);
             
             // Run chosen I/O operation
-            if test == 0 || (test == 1 && !compare_pattern){
+            if (io_type == 'r' && !compare_pattern) || io_type == 'w' {
                 conduct_io_operation(sen_clone, disk_number, num_threads, threads.clone(), buffer_size, limit, io_type, pattern, iterations, time);
             } else {
-                conduct_data_comparison(sen_clone, num_threads, threads.clone(), disk_number, pattern, limit, sector_size, buffer_size, iterations, time, test, compare_pattern);
+                conduct_data_comparison(sen_clone, num_threads, threads.clone(), disk_number, pattern, limit, sector_size, buffer_size, iterations, time, test, compare_pattern, io_type);
             }
         });
         threads -= 1;
@@ -429,7 +444,6 @@ fn conduct_io_operation(sender: std::sync::mpsc::Sender<String>, disk_number: u8
         let last_pos: u64 = local_limit * id - buffer_size;
 
         if io_type == 'w' {
-            info!("Write mode selected");
             // Set up references for write buffer and copy pattern data into buffer 
             let write_buffer_ptr_raw: *mut [u64] = std::ptr::slice_from_raw_parts_mut(buffer, buffer_size as usize / std::mem::size_of::<u64>()) as *mut [u64];
             let write_buf: &mut [u64];
@@ -463,7 +477,6 @@ fn conduct_io_operation(sender: std::sync::mpsc::Sender<String>, disk_number: u8
             elapsed_time = now.elapsed();
             debug!("Thread {} took {} seconds to finish writing", id, elapsed_time.as_secs());
         } else if io_type == 'r' {
-            info!("Read mode selected");
             now = Instant::now();
             while pos <= last_pos {
                 let read = unsafe {
@@ -501,7 +514,7 @@ fn conduct_io_operation(sender: std::sync::mpsc::Sender<String>, disk_number: u8
 
 
 // Multithreaded write/compare data patterns
-fn conduct_data_comparison(sender: std::sync::mpsc::Sender<String>, num_threads: u64, id: u64, disk_number: u8, mut original_pattern: u64, size: u64, _sector_size: u64, buffer_size: u64, loops: u64, time: u64, test: u8, compare_pattern: bool) {
+fn conduct_data_comparison(sender: std::sync::mpsc::Sender<String>, num_threads: u64, id: u64, disk_number: u8, mut original_pattern: u64, size: u64, _sector_size: u64, buffer_size: u64, loops: u64, time: u64, test: Test, compare_pattern: bool, io_type: char) {
     let mut pattern = original_pattern;     // For data comparisons
     let local_limit = calculate_nearest_multiple(PAGE_SIZE, size / num_threads);     // Align full IO size
     let path = format_drive_num(disk_number);
@@ -546,6 +559,10 @@ fn conduct_data_comparison(sender: std::sync::mpsc::Sender<String>, num_threads:
 
     let mut i: u64 = 0;
     let now = Instant::now();
+
+    // Assign iteration count based on test type
+
+
     while i < loops {
         // Move file pointer based on calculated byte offset
         let mut _pointer = unsafe {
@@ -569,42 +586,43 @@ fn conduct_data_comparison(sender: std::sync::mpsc::Sender<String>, num_threads:
         let mut read_buf: &mut [u64];
 
         // Full write
-        while pos <= last_pos as u64 {
+        if io_type != 'r' {
+            while pos <= last_pos as u64 {
+                // Write to drive
+                let write = unsafe {
+                    FileSystem::WriteFile(
+                        handle,
+                        write_buffer,
+                        buffer_size as DWORD,
+                        bytes_completed_ptr,
+                        null_mut()
+                    )
+                };
 
-            // Write to drive
-            let write = unsafe {
-                FileSystem::WriteFile(
-                    handle,
-                    write_buffer,
-                    buffer_size as DWORD,
-                    bytes_completed_ptr,
-                    null_mut()
-                )
-            };
+                pos += bytes_completed as u64;
 
-            pos += bytes_completed as u64;
-
-            if write == false {
-                error!("Thread {} encountered Error Code {}", id, win32::last_error());
-                break;
-            }
-            if time > 0 {
-                if now.elapsed().as_secs() > time {
+                if write == false {
+                    error!("Thread {} encountered Error Code {}", id, win32::last_error());
                     break;
+                }
+                if time > 0 {
+                    if now.elapsed().as_secs() > time {
+                        break;
+                    }
                 }
             }
         }
         let mut iterations: u8 = 0;
         let runs: u8;
-        if test == 1 {
-            runs = 64;
+        if test == Test::MovingInversions {
+            runs = 64;      // We want the 64-bit pattern to be fully shifted for this test, so we run the bit shift 64 times
         } else {
-            runs = 1;
+            runs = 1;       // Only one pattern being compared if we are running read/compare, so no need for 64 iterations
         }
     
-        // 64 iterations to allow complete bit shift
+        // Conduct specific I/O tests
         while iterations < runs {
-            if test == 1 {      // Shift pattern and modify write buffer
+            if test == Test::MovingInversions {      // Shift pattern and modify write buffer
                 original_pattern = pattern;
                 pattern = bit_shift(pattern, 1);
                 pattern_data = vec![pattern; buffer_size as usize / std::mem::size_of::<u64>()];
@@ -659,7 +677,7 @@ fn conduct_data_comparison(sender: std::sync::mpsc::Sender<String>, num_threads:
                 }
                 
 
-                if test == 1 {
+                if test == Test::MovingInversions {
                     // Move pointer back to conduct write
                     _pointer = unsafe {
                         FileSystem::SetFilePointerEx(
@@ -709,7 +727,7 @@ fn conduct_data_comparison(sender: std::sync::mpsc::Sender<String>, num_threads:
     let elapsed_time = now.elapsed();
     debug!("Thread {} took {} seconds to finish", id, elapsed_time.as_secs());
     unsafe {
-        // Clean up resources
+        // Clean up resources and close handle
         VirtualFree(read_buffer, 0, MEM_RELEASE);
         VirtualFree(write_buffer, 0, MEM_RELEASE);
         Foundation::CloseHandle(handle);
@@ -747,7 +765,7 @@ fn format_drive_num(drive_num: u8) -> String {
 }
 
 
-// Shift number by given number of bytes
+// Shift number by specific amount of bits
 fn bit_shift(data: u64, iterations: u64) -> u64 {
     let rotation = iterations % 16;        // Reset after each digit has been shifted once
     let bit_count = rotation * 4;
@@ -806,6 +824,8 @@ fn parse_script(stdout: &str, id_json: &mut JsonValue) {
     }
 }
 
+
+// For parsing PowerShell output
 fn split_char(c: char) -> bool {
     return c == '@' || c == '{' || c == '}';
 }
@@ -864,19 +884,23 @@ fn get_buffer_size(input: &str) -> u64 {
 }
 
 
-fn select_test_type(id: u8) {
-    match id {
+fn select_test_type(id: u8) -> Test {
+    match id {      // Change this
         0 => {
-            info!("Default Test: Any Pattern Full Write No Comparison 1*[>W]");
+            info!("Test: Any Pattern Full Write No Comparison - i*[>W]");
+            return Test::WriteOnly;
         },
         1 => {
-            info!("Test: Any Pattern 64 Bit Moving Inversions with Data Comparison 1*[>W 64*[>r,c,w~]]");
+            info!("Test: Any Pattern 64 Bit Moving Inversions with Data Comparison - i*[>W 64*[>r,c,w~]]");
+            return Test::MovingInversions;
         },
         2 => {
-            info!("Test: Any Pattern 64 Bit Moving Inversions with Data Comparison 1*[>W [>r,c]]");
+            info!("Test: Any Pattern 64 Bit Write with Data Comparison - [>W i*[>r,c]]");
+            return Test::ReadCompare;
         },
         _ => {
             info!("Test ID does not exist, defaulting to write only mode...");
+            return Test::WriteOnly;
         }
     }
 }
