@@ -169,7 +169,7 @@ fn main() {
                         [array]$Partitions = Get-Partition $DiskNumber
                         $Disk | Add-Member -MemberType NoteProperty -Name 'Partitions' -Value ($Partitions.count)
                     }
-                    $Table = $DiskInfo | Format-Table 'DeviceId', 'FriendlyName', 'SerialNumber', 'MediaType', 'Partitions', 'Sector Size'
+                    $Table = $DiskInfo | Format-Table 'DeviceId', 'FriendlyName', 'SerialNumber', 'MediaType', 'Partitions', 'Sector Size', 'Firmware Version'
                     Write-Output $Table
                 "#).unwrap();
                 println!("Physical Drive Information:\n{}", output.stdout().unwrap());
@@ -193,16 +193,16 @@ fn main() {
         exit(0);
     }
 
-    if args.is_present("read") {
-        io_type = 'r';      // Read
-        warn!("Read/compare mode, all write operations will be canceled");
-    } else if args.is_present("write") {
-        info!("Write mode");
-        io_type = 'w';      // Write
-    } else if args.is_present("test") {
+    if args.is_present("test") {
         let id: u8 = args.value_of("test").unwrap().parse().expect("Test ID must be a valid integer");
         test = select_test_type(id);
         io_type = 't';      // Test
+    } else if args.is_present("write") {
+        info!("Write mode");
+        io_type = 'w';      // Write
+    } else if args.is_present("read") {
+        io_type = 'r';      // Read
+        warn!("Read/compare mode, all write operations will be canceled");
     } else {
         warn!("Please specify an I/O operation OR test case (--help for more information)");
         exit(0);
@@ -275,6 +275,7 @@ fn main() {
             info!("Serial Number: {}", &device["SerialNumber"]);
             info!("Size: {} bytes", size);
             info!("Media Type: {}", &device["MediaType"]);
+            info!("Firmware Version: {}", &device["Firmware Version"]);
             break;
         }
     }    
@@ -447,6 +448,8 @@ fn conduct_io_operation(sender: std::sync::mpsc::Sender<String>, disk_number: u8
             // Set up references for write buffer and copy pattern data into buffer 
             let write_buffer_ptr_raw: *mut [u64] = std::ptr::slice_from_raw_parts_mut(buffer, buffer_size as usize / std::mem::size_of::<u64>()) as *mut [u64];
             let write_buf: &mut [u64];
+
+            // Dereference buffer to add pattern data
             unsafe {
                 let buf_ptr: *mut [u64] = write_buffer_ptr_raw as *mut [u64];
                 write_buf = &mut *buf_ptr;
@@ -560,9 +563,6 @@ fn conduct_data_comparison(sender: std::sync::mpsc::Sender<String>, num_threads:
     let mut i: u64 = 0;
     let now = Instant::now();
 
-    // Assign iteration count based on test type
-
-
     while i < loops {
         // Move file pointer based on calculated byte offset
         let mut _pointer = unsafe {
@@ -612,12 +612,12 @@ fn conduct_data_comparison(sender: std::sync::mpsc::Sender<String>, num_threads:
                 }
             }
         }
-        let mut iterations: u8 = 0;
-        let runs: u8;
+        let mut iterations: u64 = 0;
+        let runs: u64;
         if test == Test::MovingInversions {
             runs = 64;      // We want the 64-bit pattern to be fully shifted for this test, so we run the bit shift 64 times
         } else {
-            runs = 1;       // Only one pattern being compared if we are running read/compare, so no need for 64 iterations
+            runs = loops;       // If we are not running a Moving Inversion test, loop the read/compares according to the iterations parameter
         }
     
         // Conduct specific I/O tests
@@ -717,6 +717,9 @@ fn conduct_data_comparison(sender: std::sync::mpsc::Sender<String>, num_threads:
                 }
             }
         }
+        if test == Test::ReadCompare {      // This test should not repeat the initial
+            break;
+        }
         i += 1;
         if time > 0 {
             if now.elapsed().as_secs() > time {
@@ -786,6 +789,28 @@ fn get_physicaldisk(device_obj: &mut JsonValue, physical_number: u8) {
     device_obj["Sector Size"] = sector_size.into();
 }
 
+fn get_firmware_info(device_obj: &mut JsonValue, unique_id: &str) {
+    let ps_script = format!("
+    $FormatEnumerationLimit = -1
+    Get-StorageFirmwareInformation -UniqueId {} | Select-Object FirmwareVersionInSlot | Format-List", unique_id);
+    match powershell_script::run(&ps_script) {
+        Ok(output) => {
+            let mut output_string: String = output.stdout().unwrap();
+            output_string = (*output_string.trim()).to_string();
+            let parts = output_string.split(" : ");
+            for part in parts {
+                if part.starts_with('{') {
+                    device_obj["Firmware Version"] = JsonValue::String(String::from(&part[1..part.len() - 1]));
+                }
+            }
+        }
+        Err(_err) => {
+            device_obj["Firmware Version"] = JsonValue::String(String::from("not found"));
+        }
+    }
+    
+}
+
 // Parse the output of the PowerShell script (Get-PhysicalDisk)
 fn parse_script(stdout: &str, id_json: &mut JsonValue) { 
     let slice = &stdout[2..stdout.len()];
@@ -803,7 +828,7 @@ fn parse_script(stdout: &str, id_json: &mut JsonValue) {
             let mut identifier = "";
             for item in field_split {
                 match item {
-                    "DeviceId" | "FriendlyName" | "SerialNumber" | "MediaType" => identifier = item,
+                    "DeviceId" | "FriendlyName" | "SerialNumber" | "MediaType" | "UniqueId" => identifier = item,
                     _ => {
                         if identifier != "" {
                             device_obj[identifier] = item.into();
@@ -813,6 +838,9 @@ fn parse_script(stdout: &str, id_json: &mut JsonValue) {
                                 if id.is_numeric() {
                                     get_physicaldisk(&mut device_obj, id_num as u8);
                                 }
+                            } else if identifier == "UniqueId" {
+                                let unique_id: &str = item;
+                                get_firmware_info(&mut device_obj, unique_id);
                             }
                             identifier = "";
                         }

@@ -43,7 +43,7 @@ This CLI allows you to run multithreaded read/write operations and data comparis
 
 `-t/--threads [THREADS]` : Number of threads to use
 
-`-n/--no-compare` : Disable data comparisons for tests
+`-n/--no-compare` : Disable data comparisons
 
 `-g/--limitgb [LIMIT]` : I/O limit (in GB)
 
