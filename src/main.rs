@@ -28,8 +28,6 @@ enum Test {
     ReadCompare
 }
 
-// TODO: wrap virtualalloc in struct with drop, better memcpy comparisons, GET RID OF WRITEONLY DEFAULT
-
 fn main() {
     // Refresh system information so drives are up to date
     let mut sysinfo = sysinfo::System::new_all();
@@ -1064,61 +1062,4 @@ fn set_thread_group(group: GROUP_AFFINITY) {
     }
 }
 
-// TODO: Retrieve Identify Controller information 
-#[allow(unused)]
-fn id_controller(h_device: Foundation::HANDLE) {
-    let status: u32;
 
-    /*
-    - Allocate a buffer that can contains both a STORAGE_PROPERTY_QUERY and a STORAGE_PROTOCOL_SPECIFIC_DATA structure.
-    - Set the PropertyID field to StorageAdapterProtocolSpecificProperty or StorageDeviceProtocolSpecificProperty for a controller or device/namespace request, respectively.
-    - Set the QueryType field to PropertyStandardQuery.
-    - Fill the STORAGE_PROTOCOL_SPECIFIC_DATA structure with the desired values. The start of the STORAGE_PROTOCOL_SPECIFIC_DATA is the AdditionalParameters field of STORAGE_PROPERTY_QUERY.
-    */
-
-    // TODO: Need to change this to use Field Offset so that the STORAGE_PROTOCOL_SPECIFIC_DATA starts at the AdditionalParameters field
-    let buffer_length: usize = size_of::<Ioctl::STORAGE_PROPERTY_QUERY>() + size_of::<Ioctl::STORAGE_PROTOCOL_SPECIFIC_DATA>() + NVME_MAX_LOG_SIZE as usize;
-    let mut returned_length: u32 = 0;
-    let returned_length_ptr: *mut u32 = &mut returned_length as *mut u32;
-
-    // Allocate buffer
-    let mut buffer = vec![0; buffer_length as usize];
-    let buffer_ptr: LPVOID = &mut buffer as *mut _ as LPVOID;
-
-    let query: *mut Ioctl::STORAGE_PROPERTY_QUERY = buffer_ptr as *mut Ioctl::STORAGE_PROPERTY_QUERY;
-    let descriptor: *mut Ioctl::STORAGE_PROTOCOL_DATA_DESCRIPTOR = buffer_ptr as *mut Ioctl::STORAGE_PROTOCOL_DATA_DESCRIPTOR;
-    let data: *mut Ioctl::STORAGE_PROTOCOL_SPECIFIC_DATA;
-
-    // Set up input buffer for DeviceIoControl
-    unsafe {
-        (*query).PropertyId = Ioctl::StorageAdapterProtocolSpecificProperty;
-        (*query).QueryType = Ioctl::PropertyStandardQuery;
-        // (*query).AdditionalParameters as *mut STORAGE_PROTOCOL_SPECIFIC_DATA;
-
-    }
-
-    // Use box instead of vec?
-    let boxed_query: Box<Ioctl::STORAGE_PROPERTY_QUERY> = Box::new(Ioctl::STORAGE_PROPERTY_QUERY {
-        PropertyId: Ioctl::StorageAdapterProtocolSpecificProperty,
-        QueryType: Ioctl::PropertyStandardQuery,
-        AdditionalParameters: [1] 
-    });
-
-    let result: Foundation::BOOL = unsafe {
-        DeviceIoControl(h_device,
-                Ioctl::IOCTL_STORAGE_QUERY_PROPERTY,
-                     buffer_ptr,
-                  buffer_length as u32,
-                    buffer_ptr,
-                 buffer_length as u32,
-                returned_length_ptr,
-                   null_mut())
-    };
-
-    if !result.as_bool() || (returned_length == 0) {
-        status = win32::last_error();
-        error!("Get Identify Controller Data failed. Error Code {}", status);
-        exit(1);
-    }
-
-}
