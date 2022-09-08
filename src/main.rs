@@ -11,6 +11,7 @@ use log::{debug, error, warn, info};
 use json::{object, JsonValue};
 use std::fs::{File, remove_file};
 use std::io::prelude::*;
+use rand::Rng;
 
 // Sector aligned buffer size constants
 const MEGABYTE: u64 = 1048576;
@@ -18,14 +19,15 @@ const GIGABYTE: u64 = 1073741824;
 const PAGE_SIZE: u64 = 4096;
 const INITIALIZATION_OFFSET: u64 = 4096;
 
-const NVME_MAX_LOG_SIZE: u64 = 0x1000;
+const NVME_MAX_LOG_SIZE: u32 = 0x1000;
 
 // Test Type
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 enum Test {
     WriteOnly,
     MovingInversions,
-    ReadCompare
+    ReadCompare,
+    RandomReads
 }
 
 // TODO: wrap virtualalloc in struct with drop, better memcpy comparisons, GET RID OF WRITEONLY DEFAULT
@@ -72,7 +74,7 @@ fn main() {
             .long("test")
             .short('T')
             .takes_value(true)
-            .help("Test case to run\nOptions:\n0. Any Pattern Full Write No Comparison Iterations*[>W] (default)\n1. Any Pattern 64 Bit Write Moving Inversions with Data Comparison i*[>W 64*[>r,c,w~]]\n2. Any Pattern 64 Bit Write with Data Comparison [>W i*[>r,c]]"))
+            .help("Test case to run\nOptions:\n0. Any Pattern Full Write No Comparison - i*[>W] (default)\n1. Any Pattern 64 Bit Moving Inversions with Data Comparison - i*[>W 64*[>r,c,w~]]\n2. Any Pattern 64 Bit Write and Read/Compare - [>W i*[>r,c]]\n3. Any Pattern 64 Bit Write and Random Read/Comparison - [>W i*[>rr,c,h,d]"))
         .arg(Arg::new("no-compare")
             .short('n')
             .long("no-compare")
@@ -88,6 +90,16 @@ fn main() {
             .long("limitmb")
             .takes_value(true)
             .help("Limit (in MB) I/O size for read/write operation"))
+        .arg(Arg::new("hold")
+            .short('h')
+            .long("hold")
+            .takes_value(true)
+            .help("Time (s) to run each random read for (only for specific test cases)"))
+        .arg(Arg::new("delay")
+            .short('d')
+            .long("delay")
+            .takes_value(true)
+            .help("Time (s) before running random reads again (only for specific test cases)"))
         .arg(Arg::new("pattern")
             .short('P')
             .long("pattern")
@@ -112,10 +124,10 @@ fn main() {
             .takes_value(false)
             .help("Display debug information in log output"))
         .arg(Arg::new("controller")
-            .short('c')
+            .short('C')
             .long("controller")
-            .takes_value(true)
-            .help("Display controller information for NVMe device"))
+            .takes_value(false)
+            .help("Display identify controller information for NVMe device"))
         .get_matches();
 
     let partitions: u8;
@@ -133,8 +145,8 @@ fn main() {
     let mut id_json: JsonValue = json::JsonValue::new_array();
     let mut time: u64 = 0;
     let mut test: Test = Test::WriteOnly;
-
-
+    let mut hold_time: u32 = 0;     // Time to run random read/compare
+    let mut delay_time: u32 = 0;    // Time before starting next read/compare cycle
 
     // Set logging type
     if args.is_present("debug") {
@@ -191,6 +203,12 @@ fn main() {
     } else {
         warn!("Must select a physical disk ID to conduct I/O operations. (--info for a list of your disks)");
         exit(0);
+    }
+
+    if args.is_present("controller") {
+        let path = &format_drive_num(disk_number);
+        let handle: Foundation::HANDLE = open_handle(path, 'w').unwrap();
+        id_controller(handle);
     }
 
     if args.is_present("test") {
@@ -257,6 +275,13 @@ fn main() {
         warn!("Requested limit is too large, truncating to the full size of the drive ({} bytes)", size);
     }
 
+    if args.is_present("hold") {
+        hold_time = args.value_of("hold").unwrap().parse().expect("Hold time valid integer");
+    }
+    if args.is_present("delay") {
+        delay_time = args.value_of("delay").unwrap().parse().expect("Delay time must be a valid integer");
+    }
+
     // Reset buffer size if necessary to avoid race conditions during threaded operations
     if threads * buffer_size > limit {
         buffer_size = calculate_nearest_multiple(PAGE_SIZE, limit / threads);
@@ -311,7 +336,7 @@ fn main() {
             if (io_type == 'r' && !compare_pattern) || io_type == 'w' {
                 conduct_io_operation(sen_clone, disk_number, num_threads, threads.clone(), buffer_size, limit, io_type, pattern, iterations, time);
             } else {
-                conduct_data_comparison(sen_clone, num_threads, threads.clone(), disk_number, pattern, limit, sector_size, buffer_size, iterations, time, test, compare_pattern, io_type);
+                conduct_data_comparison(sen_clone, num_threads, threads.clone(), disk_number, pattern, limit, sector_size, buffer_size, iterations, time, test, compare_pattern, io_type, hold_time, delay_time);
             }
         });
         threads -= 1;
@@ -471,10 +496,8 @@ fn conduct_io_operation(sender: std::sync::mpsc::Sender<String>, disk_number: u8
                     error!("Thread {} encountered Error Code {}", id, win32::last_error());
                     break;
                 }
-                if time > 0 {
-                    if now.elapsed().as_secs() > time {
-                        break;
-                    }
+                if time > 0 && now.elapsed().as_secs() > time {
+                    break;
                 }
         }
             elapsed_time = now.elapsed();
@@ -496,10 +519,8 @@ fn conduct_io_operation(sender: std::sync::mpsc::Sender<String>, disk_number: u8
                     error!("Thread {} encountered Error Code {}", id, win32::last_error());
                     break;
                 }
-                if time > 0 {
-                    if now.elapsed().as_secs() > time {
-                        break;
-                    }
+                if time > 0 && now.elapsed().as_secs() > time {
+                    break;
                 }
             }
             elapsed_time = now.elapsed();
@@ -517,7 +538,7 @@ fn conduct_io_operation(sender: std::sync::mpsc::Sender<String>, disk_number: u8
 
 
 // Multithreaded write/compare data patterns
-fn conduct_data_comparison(sender: std::sync::mpsc::Sender<String>, num_threads: u64, id: u64, disk_number: u8, mut original_pattern: u64, size: u64, _sector_size: u64, buffer_size: u64, loops: u64, time: u64, test: Test, compare_pattern: bool, io_type: char) {
+fn conduct_data_comparison(sender: std::sync::mpsc::Sender<String>, num_threads: u64, id: u64, disk_number: u8, mut original_pattern: u64, size: u64, _sector_size: u64, buffer_size: u64, loops: u64, time: u64, test: Test, compare_pattern: bool, io_type: char, hold_time: u32, delay_time: u32) {
     let mut pattern = original_pattern;     // For data comparisons
     let local_limit = calculate_nearest_multiple(PAGE_SIZE, size / num_threads);     // Align full IO size
     let path = format_drive_num(disk_number);
@@ -541,6 +562,12 @@ fn conduct_data_comparison(sender: std::sync::mpsc::Sender<String>, num_threads:
             PAGE_EXECUTE_READWRITE
         )
     };
+
+    // Require hold time to be set to conduct Random Reads/Compare test
+    if test == Test::RandomReads && hold_time <= 0 {
+        error!("Must set time limit for random reads with `-h--hold` (--help for more info)");
+        return;
+    }
 
     // Set up references for write buffer and copy pattern data into buffer 
     let write_buffer_ptr_raw: *mut [u64] = std::ptr::slice_from_raw_parts_mut(write_buffer, buffer_size as usize / std::mem::size_of::<u64>()) as *mut [u64];
@@ -581,6 +608,9 @@ fn conduct_data_comparison(sender: std::sync::mpsc::Sender<String>, num_threads:
         let last_pos: u64 = local_limit * id - buffer_size;
         let mut received: u64;
 
+        // Maximum integer that can be used as a multiplier to read from a random offset within this thread's range
+        let random_multiplier_range: u64 = local_limit / buffer_size;
+
         // Set up raw pointer and reference for read buffer
         let mut read_buffer_ptr_raw: *mut [u64];
         let mut read_buf: &mut [u64];
@@ -605,10 +635,8 @@ fn conduct_data_comparison(sender: std::sync::mpsc::Sender<String>, num_threads:
                     error!("Thread {} encountered Error Code {}", id, win32::last_error());
                     break;
                 }
-                if time > 0 {
-                    if now.elapsed().as_secs() > time {
-                        break;
-                    }
+                if time > 0 && now.elapsed().as_secs() > time {
+                    break;
                 }
             }
         }
@@ -640,84 +668,147 @@ fn conduct_data_comparison(sender: std::sync::mpsc::Sender<String>, num_threads:
                 )
             };
 
-            // Full read/compare
-            while pos <= last_pos {
-                let read = unsafe {
-                    FileSystem::ReadFile(
-                        handle,
-                        read_buffer,
-                        buffer_size as DWORD,
-                        bytes_completed_ptr,
-                        null_mut()
-                    )
-                };
+            // Random Read/Compare test
+            if test == Test::RandomReads {
+                let now = Instant::now();
+                while now.elapsed().as_secs() < hold_time as u64 {
+                    // Generate random multiplier
+                    let random_multiplier = rand::thread_rng().gen_range(0..random_multiplier_range);
+                    let random_offset = random_multiplier * buffer_size;
 
-                if compare_pattern {
-                    // Retrieve data from read buffer for comparison
-                    read_buffer_ptr_raw = std::ptr::slice_from_raw_parts_mut(read_buffer, buffer_size as usize / std::mem::size_of::<u64>()) as *mut [u64];
-                    unsafe {
-                        let buf_ptr: *mut [u64] = read_buffer_ptr_raw as *mut [u64];
-                        read_buf = &mut *buf_ptr;
-                    }
-
-                    // Compare read buffer to pattern
-                    received = read_buf[0];
-                    if received != original_pattern {
-                        error!(   
-                            "Data corruption at offset {}! Iteration {}, Thread {}. Actual({:#018x}) vs Expected({:#018x})", pos, iterations, id, received, original_pattern
-                        );
-                    }
-                    
-                }
-
-                pos += bytes_completed as u64;
-                if read == false {
-                    error!("Thread {} encountered Error Code {}", id, win32::last_error());
-                    break;
-                }
-                
-
-                if test == Test::MovingInversions {
-                    // Move pointer back to conduct write
+                    // Move file pointer to random locations to conduct Random Reads/Compare test
                     _pointer = unsafe {
                         FileSystem::SetFilePointerEx(
                             handle,
-                            (bytes_completed as i64 * -1) as i64,
+                            (offset + INITIALIZATION_OFFSET + random_offset) as i64,
                             null_mut(),
-                            FileSystem::FILE_CURRENT
+                            FileSystem::FILE_BEGIN
                         )
                     };
 
-                    // Write shifted pattern to same LBA
-                    let write = unsafe {
-                        FileSystem::WriteFile(
+                    // Read from random location
+                    let read = unsafe {
+                        FileSystem::ReadFile(
                             handle,
-                            write_buffer,
+                            read_buffer,
                             buffer_size as DWORD,
                             bytes_completed_ptr,
                             null_mut()
                         )
                     };
 
-                    if write == false {
+                    if compare_pattern {
+                        // Retrieve data from read buffer for comparison
+                        read_buffer_ptr_raw = std::ptr::slice_from_raw_parts_mut(read_buffer, buffer_size as usize / std::mem::size_of::<u64>()) as *mut [u64];
+                        unsafe {
+                            let buf_ptr: *mut [u64] = read_buffer_ptr_raw as *mut [u64];
+                            read_buf = &mut *buf_ptr;
+                        }
+    
+                        // Compare read buffer to pattern
+                        received = read_buf[0];
+                        if received != original_pattern {
+                            error!(   
+                                "Data corruption at offset {}! Iteration {}, Thread {}. Actual({:#018x}) vs Expected({:#018x})", pos, iterations, id, received, original_pattern
+                            );
+                        }
+                        
+                    }
+    
+                    if read == false {
                         error!("Thread {} encountered Error Code {}", id, win32::last_error());
                         break;
                     }
+
                 }
-                if time > 0 {
-                    if now.elapsed().as_secs() > time {
+
+                // Sleep for requested delay time before next cycle starts
+                let wait_time = std::time::Duration::from_secs(delay_time as u64);
+                thread::sleep(wait_time);
+                iterations += 1;
+                if time > 0 && now.elapsed().as_secs() > time {
+                    break;
+                }
+            } else {
+                // Full read/compare
+                while pos <= last_pos {
+
+                    let read = unsafe {
+                        FileSystem::ReadFile(
+                            handle,
+                            read_buffer,
+                            buffer_size as DWORD,
+                            bytes_completed_ptr,
+                            null_mut()
+                        )
+                    };
+
+                    if compare_pattern {
+                        // Retrieve data from read buffer for comparison
+                        read_buffer_ptr_raw = std::ptr::slice_from_raw_parts_mut(read_buffer, buffer_size as usize / std::mem::size_of::<u64>()) as *mut [u64];
+                        unsafe {
+                            let buf_ptr: *mut [u64] = read_buffer_ptr_raw as *mut [u64];
+                            read_buf = &mut *buf_ptr;
+                        }
+
+                        // Compare read buffer to pattern
+                        received = read_buf[0];
+                        if received != original_pattern {
+                            error!(   
+                                "Data corruption at offset {}! Iteration {}, Thread {}. Actual({:#018x}) vs Expected({:#018x})", pos, iterations, id, received, original_pattern
+                            );
+                        }
+                        
+                    }
+
+                    pos += bytes_completed as u64;
+                    if read == false {
+                        error!("Thread {} encountered Error Code {}", id, win32::last_error());
                         break;
                     }
+                    
+
+                    if test == Test::MovingInversions {
+                        // Move pointer back to conduct write
+                        _pointer = unsafe {
+                            FileSystem::SetFilePointerEx(
+                                handle,
+                                (bytes_completed as i64 * -1) as i64,
+                                null_mut(),
+                                FileSystem::FILE_CURRENT
+                            )
+                        };
+
+                        // Write shifted pattern to same LBA
+                        let write = unsafe {
+                            FileSystem::WriteFile(
+                                handle,
+                                write_buffer,
+                                buffer_size as DWORD,
+                                bytes_completed_ptr,
+                                null_mut()
+                            )
+                        };
+
+                        if write == false {
+                            error!("Thread {} encountered Error Code {}", id, win32::last_error());
+                            break;
+                        }
+                    }
+                    if time > 0 {
+                        if now.elapsed().as_secs() > time {
+                            break;
+                        }
+                    }
                 }
-            }
-            iterations += 1;
-            if time > 0 {
-                if now.elapsed().as_secs() > time {
+                iterations += 1;
+                if time > 0 && now.elapsed().as_secs() > time {
                     break;
                 }
             }
+            
         }
-        if test == Test::ReadCompare {      // This test should not repeat the initial
+        if test == Test::ReadCompare || test == Test::RandomReads {      // These tests test should not repeat the initial write
             break;
         }
         i += 1;
@@ -923,8 +1014,12 @@ fn select_test_type(id: u8) -> Test {
             return Test::MovingInversions;
         },
         2 => {
-            info!("Test: Any Pattern 64 Bit Write with Data Comparison - [>W i*[>r,c]]");
+            info!("Test: Any Pattern 64 Bit Write and Read/Compare - [>W i*[>r,c]]");
             return Test::ReadCompare;
+        },
+        3 => {
+            info!("Test: Any Pattern 64 Bit Write and Random Read/Comparison - [>W i*[>rr,c,h,d]");
+            return Test::RandomReads;
         },
         _ => {
             info!("Test ID does not exist, defaulting to write only mode...");
@@ -1076,49 +1171,70 @@ fn id_controller(h_device: Foundation::HANDLE) {
     - Fill the STORAGE_PROTOCOL_SPECIFIC_DATA structure with the desired values. The start of the STORAGE_PROTOCOL_SPECIFIC_DATA is the AdditionalParameters field of STORAGE_PROPERTY_QUERY.
     */
 
-    // TODO: Need to change this to use Field Offset so that the STORAGE_PROTOCOL_SPECIFIC_DATA starts at the AdditionalParameters field
-    let buffer_length: usize = size_of::<Ioctl::STORAGE_PROPERTY_QUERY>() + size_of::<Ioctl::STORAGE_PROTOCOL_SPECIFIC_DATA>() + NVME_MAX_LOG_SIZE as usize;
+    // Buffer must be big enough to cintain both a STORAGE_PROPERTY_QUERY and a STORAGE_PROTOCOL_SPECIFIC_DATA structure
+    let buffer_length: usize = field_offset::offset_of!(Ioctl::STORAGE_PROPERTY_QUERY => AdditionalParameters).get_byte_offset() + size_of::<Ioctl::STORAGE_PROTOCOL_SPECIFIC_DATA>() + NVME_MAX_LOG_SIZE as usize;
+
     let mut returned_length: u32 = 0;
     let returned_length_ptr: *mut u32 = &mut returned_length as *mut u32;
 
     // Allocate buffer
-    let mut buffer = vec![0; buffer_length as usize];
-    let buffer_ptr: LPVOID = &mut buffer as *mut _ as LPVOID;
+    // let mut buffer = vec![0; buffer_length as usize];
+    // let buffer_ptr: LPVOID = &mut buffer as *mut _ as LPVOID;
 
-    let query: *mut Ioctl::STORAGE_PROPERTY_QUERY = buffer_ptr as *mut Ioctl::STORAGE_PROPERTY_QUERY;
-    let descriptor: *mut Ioctl::STORAGE_PROTOCOL_DATA_DESCRIPTOR = buffer_ptr as *mut Ioctl::STORAGE_PROTOCOL_DATA_DESCRIPTOR;
-    let data: *mut Ioctl::STORAGE_PROTOCOL_SPECIFIC_DATA;
-
-    // Set up input buffer for DeviceIoControl
-    unsafe {
-        (*query).PropertyId = Ioctl::StorageAdapterProtocolSpecificProperty;
-        (*query).QueryType = Ioctl::PropertyStandardQuery;
-        // (*query).AdditionalParameters as *mut STORAGE_PROTOCOL_SPECIFIC_DATA;
-
-    }
-
-    // Use box instead of vec?
-    let boxed_query: Box<Ioctl::STORAGE_PROPERTY_QUERY> = Box::new(Ioctl::STORAGE_PROPERTY_QUERY {
-        PropertyId: Ioctl::StorageAdapterProtocolSpecificProperty,
-        QueryType: Ioctl::PropertyStandardQuery,
-        AdditionalParameters: [1] 
-    });
-
-    let result: Foundation::BOOL = unsafe {
-        DeviceIoControl(h_device,
-                Ioctl::IOCTL_STORAGE_QUERY_PROPERTY,
-                     buffer_ptr,
-                  buffer_length as u32,
-                    buffer_ptr,
-                 buffer_length as u32,
-                returned_length_ptr,
-                   null_mut())
+    // Allocate sector-aligned buffer with Win32 VirtualAlloc
+    let buf: LPVOID = unsafe {
+        VirtualAlloc(
+            null_mut(),
+            buffer_length as usize,
+            MEM_COMMIT | MEM_RESERVE,
+            PAGE_EXECUTE_READWRITE
+        )
     };
+    let buffer_ptr_raw: *mut u8 = std::ptr::slice_from_raw_parts_mut(buf, buffer_length as usize / std::mem::size_of::<u8>()) as *mut u8;
 
-    if !result.as_bool() || (returned_length == 0) {
-        status = win32::last_error();
-        error!("Get Identify Controller Data failed. Error Code {}", status);
-        exit(1);
+    unsafe {
+        let query_ptr: *mut Ioctl::STORAGE_PROPERTY_QUERY = std::mem::transmute::<*mut u8, *mut Ioctl::STORAGE_PROPERTY_QUERY>(buffer_ptr_raw);
+        let query: &mut Ioctl::STORAGE_PROPERTY_QUERY = &mut *query_ptr;
+
+        let protocol_data_ptr: *mut Ioctl::STORAGE_PROTOCOL_SPECIFIC_DATA = std::mem::transmute::<*mut u8, *mut Ioctl::STORAGE_PROTOCOL_SPECIFIC_DATA>(query.AdditionalParameters.as_mut_ptr());
+        let protocol_data: &mut Ioctl::STORAGE_PROTOCOL_SPECIFIC_DATA = &mut *protocol_data_ptr;
+        
+        
+        query.PropertyId = Ioctl::StorageAdapterProtocolSpecificProperty;
+        query.QueryType = Ioctl::PropertyStandardQuery;
+
+        protocol_data.ProtocolType = Ioctl::ProtocolTypeNvme;
+        protocol_data.DataType = 1;     // Ioctl::NVMeDataTypeIdentify is not implemented correctly, so use simple 
+        protocol_data.ProtocolDataRequestValue = 1;     // NVME_IDENTIFY_CNS_CONTROLLER
+        protocol_data.ProtocolDataRequestSubValue = 0;
+        protocol_data.ProtocolDataOffset = size_of::<Ioctl::STORAGE_PROTOCOL_SPECIFIC_DATA>() as u32;
+        protocol_data.ProtocolDataLength = NVME_MAX_LOG_SIZE;
+
+        let result: Foundation::BOOL = DeviceIoControl(h_device,
+            Ioctl::IOCTL_STORAGE_QUERY_PROPERTY,
+            buf,
+            buffer_length as u32,
+            buf,
+            buffer_length as u32,
+        returned_length_ptr,
+            null_mut()
+        );
+
+        if !result.as_bool() || (returned_length == 0) {
+            status = win32::last_error();
+            error!("Get Identify Controller Data failed. Error Code {}", status);
+            exit(1);
+        }
+    
+        println!("Returned length: {}", returned_length);
+        let write_buffer_ptr_raw: *mut [u8] = std::ptr::slice_from_raw_parts_mut(buf, buffer_length as usize / std::mem::size_of::<u8>()) as *mut [u8];
+        let write_buf: &mut [u8];
+        let buf_ptr: *mut [u8] = write_buffer_ptr_raw as *mut [u8];
+        write_buf = &mut *buf_ptr;
+        println!("Should b 48: {}", protocol_data.ProtocolDataOffset);
+        for i in 0..100 {
+            println!("{}: {:#02X}", i, write_buf[i as usize]);
+        }
     }
-
+    
 }

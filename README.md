@@ -55,6 +55,10 @@ This CLI allows you to run multithreaded read/write operations and data comparis
 
 `--time [LENGTH]` : Time limit (s) before program exits
 
+`-h/--hold` : Time (s) to run each random read for (only for specific test cases)
+
+`-d/--delay` : Time (s) before running random reads again (only for specific test cases)
+
 `-i/--iterations [LOOPS]` : Number of times to conduct I/O test 
 
 `--use-groups` : Optional flag that allows program to utilize multiple processor groups for increased performance
@@ -62,6 +66,17 @@ This CLI allows you to run multithreaded read/write operations and data comparis
 `--debug` : Print debug information in log output
 
 `--info` : Print information about the machine's physical drives
+
+
+## _**Tests**_
+
+### **Write Only**
+
+### **Moving Inversions**
+
+### **Read Compare**
+
+### **Random Reads**
 
 
 ## _**Use Cases**_

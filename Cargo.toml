@@ -15,6 +15,8 @@ affinity = "0.1.2"
 env_logger = "0.9.0"
 log = "0.4.17"
 json = "0.12.4"
+field-offset = "0.3.4"
+rand = "0.8.5"
 
 [dependencies.windows]
 version = "0.39.0"
