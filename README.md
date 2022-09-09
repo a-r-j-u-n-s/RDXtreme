@@ -76,7 +76,9 @@ This CLI allows you to run multithreaded read/write operations and data comparis
 
 ### **Read Compare**
 
-### **Random Reads**
+### **Random Read/Compare**
+
+### **Random Write/Read
 
 
 ## _**Use Cases**_

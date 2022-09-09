@@ -3,7 +3,7 @@ use windows::{core::PCWSTR, Win32::{Storage::FileSystem, Foundation, System::{Io
 use sysinfo::SystemExt;
 use powershell_script;
 use clap::Arg;
-use std::{time::Instant, mem::{size_of, drop}, ptr::{null_mut, null}, process::exit, thread, string::String, sync::mpsc::{channel, Sender, Receiver}};
+use std::{time::Instant, mem::{size_of, drop}, ptr::{null_mut, null}, process::exit, thread, string::String, sync::mpsc::{channel, Sender, Receiver}, u32::MAX};
 use winapi::{shared::minwindef::{DWORD, LPVOID}, um::{fileapi::OPEN_EXISTING, winbase::FILE_FLAG_NO_BUFFERING, winnt::{FILE_SHARE_READ, FILE_SHARE_WRITE, GENERIC_WRITE, GENERIC_READ, MEM_COMMIT, MEM_RESERVE, MEM_RELEASE, PAGE_EXECUTE_READWRITE}, memoryapi::{VirtualAlloc, VirtualFree}}};
 use affinity::*;
 use std::num::ParseIntError;
@@ -27,7 +27,8 @@ enum Test {
     WriteOnly,
     MovingInversions,
     ReadCompare,
-    RandomReads
+    RandomReads,
+    RandomWriteCycle
 }
 
 // TODO: wrap virtualalloc in struct with drop, better memcpy comparisons, GET RID OF WRITEONLY DEFAULT
@@ -74,7 +75,7 @@ fn main() {
             .long("test")
             .short('T')
             .takes_value(true)
-            .help("Test case to run\nOptions:\n0. Any Pattern Full Write No Comparison - i*[>W] (default)\n1. Any Pattern 64 Bit Moving Inversions with Data Comparison - i*[>W 64*[>r,c,w~]]\n2. Any Pattern 64 Bit Write and Read/Compare - [>W i*[>r,c]]\n3. Any Pattern 64 Bit Write and Random Read/Comparison - [>W i*[>rr,c,h,d]"))
+            .help("Test case to run\nOptions:\n0. Any Pattern Full Write No Comparison - i*[>W] (default)\n1. Any Pattern 64 Bit Moving Inversions with Data Comparison - i*[>W 64*[>r,c,w~]]\n2. Any Pattern 64 Bit Write and Read/Compare - [>W i*[>r,c]]\n3. Any Pattern 64 Bit Write and Random Read/Compare - [>W i*[>rr,c,h,d]\n4. Any Pattern 64 Bit Random Write/Read/Compare - T*[>ww,r,c]"))
         .arg(Arg::new("no-compare")
             .short('n')
             .long("no-compare")
@@ -315,6 +316,18 @@ fn main() {
     if args.is_present("time") {
         time = args.value_of("time").unwrap().parse().expect("time must be a valid integer");
         info!("Program will stop after {} seconds", time);
+    }
+
+    // Require hold time to be set to conduct Random Reads/Compare test
+    if test == Test::RandomReads && hold_time <= 0 {
+        error!("Must set time limit for random reads with `-h--hold` (--help for more info)");
+        return;
+    }
+
+    // Require time limit to be set if running Random Write/Read/Compare Cycle test
+    if test == Test::RandomWriteCycle && time <= 0 {
+        warn!("Random Write/Read/Compare test will run indefinitely and must be terminated with Ctrl^C");
+        time = MAX as u64;
     }
 
     let num_cores = get_core_num();     // CPU cores in the current processor group
@@ -563,12 +576,6 @@ fn conduct_data_comparison(sender: std::sync::mpsc::Sender<String>, num_threads:
         )
     };
 
-    // Require hold time to be set to conduct Random Reads/Compare test
-    if test == Test::RandomReads && hold_time <= 0 {
-        error!("Must set time limit for random reads with `-h--hold` (--help for more info)");
-        return;
-    }
-
     // Set up references for write buffer and copy pattern data into buffer 
     let write_buffer_ptr_raw: *mut [u64] = std::ptr::slice_from_raw_parts_mut(write_buffer, buffer_size as usize / std::mem::size_of::<u64>()) as *mut [u64];
     let write_buf: &mut [u64];
@@ -614,6 +621,87 @@ fn conduct_data_comparison(sender: std::sync::mpsc::Sender<String>, num_threads:
         // Set up raw pointer and reference for read buffer
         let mut read_buffer_ptr_raw: *mut [u64];
         let mut read_buf: &mut [u64];
+
+        // Random Write/Read/Compare Cycle
+        if test == Test::RandomWriteCycle {
+            let now = Instant::now();
+            while now.elapsed().as_secs() < time {
+                // Generate random multiplier
+                let random_multiplier = rand::thread_rng().gen_range(0..random_multiplier_range);
+                let random_offset = random_multiplier * buffer_size;
+
+                // Move file pointer to random locations to conduct Random Reads/Compare test
+                _pointer = unsafe {
+                    FileSystem::SetFilePointerEx(
+                        handle,
+                        (offset + INITIALIZATION_OFFSET + random_offset) as i64,
+                        null_mut(),
+                        FileSystem::FILE_BEGIN
+                    )
+                };
+
+                // Write to random location
+                let write = unsafe {
+                    FileSystem::WriteFile(
+                        handle,
+                        write_buffer,
+                        buffer_size as DWORD,
+                        bytes_completed_ptr,
+                        null_mut()
+                    )
+                };
+
+                if write == false {
+                    error!("Thread {} encountered Error Code {}", id, win32::last_error());
+                    break;
+                }
+
+                // Move pointer back to conduct read
+                _pointer = unsafe {
+                    FileSystem::SetFilePointerEx(
+                        handle,
+                        (bytes_completed as i64 * -1) as i64,
+                        null_mut(),
+                        FileSystem::FILE_CURRENT
+                    )
+                };
+                
+                // Read from same location
+                let read = unsafe {
+                    FileSystem::ReadFile(
+                        handle,
+                        read_buffer,
+                        buffer_size as DWORD,
+                        bytes_completed_ptr,
+                        null_mut()
+                    )
+                };
+
+                if read == false {
+                    error!("Thread {} encountered Error Code {}", id, win32::last_error());
+                    break;
+                }
+
+                if compare_pattern {
+                    // Retrieve data from read buffer for comparison
+                    read_buffer_ptr_raw = std::ptr::slice_from_raw_parts_mut(read_buffer, buffer_size as usize / std::mem::size_of::<u64>()) as *mut [u64];
+                    unsafe {
+                        let buf_ptr: *mut [u64] = read_buffer_ptr_raw as *mut [u64];
+                        read_buf = &mut *buf_ptr;
+                    }
+
+                    // Compare read buffer to pattern
+                    received = read_buf[0];
+                    if received != original_pattern {
+                        error!(   
+                            "Data corruption at offset {}! Thread {}. Actual({:#018x}) vs Expected({:#018x})", pos, id, received, original_pattern
+                        );
+                    }
+                    
+                }
+            }
+            break;
+        }
 
         // Full write
         if io_type != 'r' {
@@ -721,9 +809,8 @@ fn conduct_data_comparison(sender: std::sync::mpsc::Sender<String>, num_threads:
                     }
 
                 }
-
                 // Sleep for requested delay time before next cycle starts
-                let wait_time = std::time::Duration::from_secs(delay_time as u64);
+                let wait_time = std::time::Duration::from_millis((delay_time * 1000) as u64);
                 thread::sleep(wait_time);
                 iterations += 1;
                 if time > 0 && now.elapsed().as_secs() > time {
@@ -1018,9 +1105,13 @@ fn select_test_type(id: u8) -> Test {
             return Test::ReadCompare;
         },
         3 => {
-            info!("Test: Any Pattern 64 Bit Write and Random Read/Comparison - [>W i*[>rr,c,h,d]");
+            info!("Test: Any Pattern 64 Bit Write and Random Read/Compare - [>W i*[>rr,c,h,d]");
             return Test::RandomReads;
         },
+        4 => {
+            info!("Test: Any Pattern 64 Bit Random Write/Read/Compare - T*[>ww,r,c]");
+            return Test::RandomWriteCycle;
+        }
         _ => {
             info!("Test ID does not exist, defaulting to write only mode...");
             return Test::WriteOnly;
@@ -1172,14 +1263,11 @@ fn id_controller(h_device: Foundation::HANDLE) {
     */
 
     // Buffer must be big enough to cintain both a STORAGE_PROPERTY_QUERY and a STORAGE_PROTOCOL_SPECIFIC_DATA structure
-    let buffer_length: usize = field_offset::offset_of!(Ioctl::STORAGE_PROPERTY_QUERY => AdditionalParameters).get_byte_offset() + size_of::<Ioctl::STORAGE_PROTOCOL_SPECIFIC_DATA>() + NVME_MAX_LOG_SIZE as usize;
+    let storage_property_query_offset = field_offset::offset_of!(Ioctl::STORAGE_PROPERTY_QUERY => AdditionalParameters).get_byte_offset();
+    let buffer_length: usize = storage_property_query_offset + size_of::<Ioctl::STORAGE_PROTOCOL_SPECIFIC_DATA>() + NVME_MAX_LOG_SIZE as usize;
 
     let mut returned_length: u32 = 0;
     let returned_length_ptr: *mut u32 = &mut returned_length as *mut u32;
-
-    // Allocate buffer
-    // let mut buffer = vec![0; buffer_length as usize];
-    // let buffer_ptr: LPVOID = &mut buffer as *mut _ as LPVOID;
 
     // Allocate sector-aligned buffer with Win32 VirtualAlloc
     let buf: LPVOID = unsafe {
@@ -1226,15 +1314,73 @@ fn id_controller(h_device: Foundation::HANDLE) {
             exit(1);
         }
     
-        println!("Returned length: {}", returned_length);
         let write_buffer_ptr_raw: *mut [u8] = std::ptr::slice_from_raw_parts_mut(buf, buffer_length as usize / std::mem::size_of::<u8>()) as *mut [u8];
         let write_buf: &mut [u8];
         let buf_ptr: *mut [u8] = write_buffer_ptr_raw as *mut [u8];
         write_buf = &mut *buf_ptr;
-        println!("Should b 48: {}", protocol_data.ProtocolDataOffset);
-        for i in 0..100 {
-            println!("{}: {:#02X}", i, write_buf[i as usize]);
-        }
+
+        // Parse byte output
+        parse_controller_buffer(write_buf, protocol_data.ProtocolDataOffset as usize + storage_property_query_offset as usize);
     }
     
+}
+
+
+// Parse the output of the Identify Controller NVMe information
+#[allow(non_snake_case)]
+fn parse_controller_buffer(buffer: &mut [u8], offset: usize) {
+    for i in offset..offset + 84 {
+        debug!("{}: {:#02X}", i, buffer[i as usize]);
+    }
+
+    // Print Vendor ID
+    let VID = format!("{:#02X}{:02X}", buffer[offset + 1], buffer[offset]);
+    println!("PCI Vendor ID (VID): {}", VID);
+
+    // Print SS Vendor ID
+    let SSVID = format!("{:#02X}{:02X}", buffer[offset + 3], buffer[offset + 2]);
+    println!("PCI Subsystem Vendor ID (SSVID): {}", SSVID);
+
+    // Print Serial Number
+    let mut SN = format!("{:#02X}", buffer[offset + 4]);
+    for i in offset + 5..offset + 23 {
+        SN += &format!("{:02X}", buffer[offset + i]);
+    }
+    println!("Serial Number (SN): {}", SN);
+
+    // Print Model Number
+    let mut MN = format!("{:#02X}", buffer[offset + 24]);
+    for i in offset + 25..offset + 63 {
+        MN += &format!("{:02X}", buffer[offset + i]);
+    }
+    println!("Model Number (MN): {}", MN);
+
+    // Print Firmware Revision
+    let mut FR = format!("{:#02X}", buffer[offset + 64]);
+    for i in offset + 65..offset + 71 {
+        FR += &format!("{:02X}", buffer[offset + i]);
+    }
+    println!("Firmware Revision (FR): {}", FR);
+
+    // Print Recommended Arbitration Burst
+    println!("Recommended Arbitration Burst (RAB): {:#02X}", buffer[offset + 72]);
+
+    // Print IEEE OUI Identifier
+    let IEEE = format!("{:#02X}{:02X}{:02X}", buffer[offset + 75], buffer[offset + 74], buffer[offset + 75]);
+    println!("IEEE OUI Identifier: {}", IEEE);
+
+    // Print Maximum Data Transfer Size
+    println!("Maximum Data Transfer Size (MDTS): {:#02X}", buffer[offset + 77]);
+
+    // Print Controller ID
+    let CNTLID = format!("{:#02X}{:02X}", buffer[offset + 79], buffer[offset + 78]);
+    println!("Controller ID (CNTLID): {}", CNTLID);
+
+     // Print Version
+     let mut VER = format!("{:#02X}", buffer[offset + 80]);
+     for i in offset + 81..offset + 83 {
+         VER += &format!("{:02X}", buffer[offset + i]);
+     }
+     println!("Version (VER): {}", VER);
+
 }
