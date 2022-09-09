@@ -39,8 +39,8 @@ fn main() {
     sysinfo.refresh_all();
 
     // CLI arguments
-    let args = clap::App::new("Storage IO Test Tool")
-        .version("v2.0.0")
+    let args = clap::App::new("rdxtreme - Storage IO Test Tool")
+        .version("v2.1.0")
         .author("Arjun Srivastava, Microsoft CHIE - ASE")
         .about("CLI to analyze and conduct multithreaded read/write IO operations and data comparison tests on single-partition physical disks")
         .arg(Arg::new("info")

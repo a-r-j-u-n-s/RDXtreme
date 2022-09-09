@@ -1,4 +1,4 @@
-# Storage Device I/O Testing Tool
+# RDXtreme - Storage Device I/O Testing Tool
 _A multithreaded I/O testing tool designed for physical storage devices_
 
 ## _About_
@@ -21,14 +21,14 @@ This CLI allows you to run multithreaded read/write operations and data comparis
 2. `cargo install` to install libraries and crates
 3. `cargo build --release` to compile and build .exe
     - `cargo build --target=aarch64-pc-windows-msvc` for ARM64
-4. `cargo run -- [FLAGS]` or run exe directly in `target/release/storageiotool.exe [FLAGS]`
+
 
 ## _**Usage**_
 
 **This tool must be run with Administrator privileges in PowerShell**
 
 ```
-./storagetiotool.exe -w/-r -p [disk #] -t [THREADS] -P [PATTERN] -g/-m [LIMIT] -b [SIZE] -i [ITERATIONS] -T [TEST] [...]
+./rdxtreme.exe -w/-r -p [disk #] -t [THREADS] -P [PATTERN] -g/-m [LIMIT] -b [SIZE] -i [ITERATIONS] -T [TEST] [...]
 ```
 
 ### Flags
@@ -70,20 +70,35 @@ This CLI allows you to run multithreaded read/write operations and data comparis
 
 ## _**Tests**_
 
-### **Write Only**
+### **0. Write Only (Default)**
+```Any Pattern Full Write No Comparison - i*[>W]```
 
-### **Moving Inversions**
+- Write full data pattern '--iteration' times
 
-### **Read Compare**
+### **1. Moving Inversions**
+```Any Pattern 64 Bit Moving Inversions with Data Comparison - i*[>W 64*[>r,c,w~]]```
 
-### **Random Read/Compare**
+- Write full data pattern then read/compare/write bit-shifted pattern 64 times and repeat '--iteration' more times
 
-### **Random Write/Read
+### **2. Read Compare**
+```Any Pattern 64 Bit Write and Read/Compare - [>W i*[>r,c]]```
+
+- Read/compare drive to requested data pattern '--iteration' times
+
+### **3. Random Read/Compare**
+```Any Pattern 64 Bit Write and Random Read/Compare - [>W i*[>rr,c,h,d]```
+
+- Write full data pattern then continuously read and compare at random addresses
+
+### **4. Random Write/Read/Compare**
+```Any Pattern 64 Bit Random Write/Read/Compare - T*[>ww,r,c]```
+
+- Write, read, and compare full data pattern at random addresses
 
 
 ## _**Use Cases**_
 
-Output from `./storageiotool.exe --info`:
+Output from `./rdxtreme.exe --info`:
 
 ```
 DeviceId FriendlyName         SerialNumber                             MediaType Partitions Sector Size
@@ -95,20 +110,20 @@ DeviceId FriendlyName         SerialNumber                             MediaType
 
 ### **Initializing SSDs to Steady State:**
 ```
-./storageiotool.exe --physical-disk 1 --threads 64 --iterations 2 --buffer 4m --test 2 --use-groups --no-compare
+./rdxtreme.exe --physical-disk 1 --threads 64 --iterations 2 --buffer 4m --test 2 --use-groups --no-compare
 ```
 - Write/read test runs 2 times with a large buffer size and multiple threads. Comparisons disabled for maximum performance
 
 
 ### **Stress-Test Drives:**
 ```
-./storageiotool.exe --physical-disk 1 --threads 128 --iterations 5 --pattern 0123456789abcdef --buffer 128k --test 1 --no-compare
+./rdxtreme.exe --physical-disk 1 --threads 128 --iterations 5 --pattern 0123456789abcdef --buffer 128k --test 1 --no-compare
 ```
 - Moving inversions data comparison test runs 100 times with many threads and a medium-sized buffer without comparisons
 
 
 ### **Find Hardware Deficiencies:**
 ```
-./storageiotool.exe --physical-disk 1 --threads 32 --iterations 10 --pattern aaaaaaaaaaaaaaa9 --buffer 16k --test 2 --debug --use-groups
+./rdxtreme.exe --physical-disk 1 --threads 32 --iterations 10 --pattern aaaaaaaaaaaaaaa9 --buffer 16k --test 2 --debug --use-groups
 ```
 - Read/compare test with a small buffer size and log debug information 
