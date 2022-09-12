@@ -67,6 +67,12 @@ This CLI allows you to run multithreaded read/write operations and data comparis
 
 `--info` : Print information about the machine's physical drives
 
+`-C/--controller` : Print Identify Controller information
+
+`-N/--namespace` : Print Identify Namespace information
+
+`-F/--firmware` : Print Firmware information
+
 
 ## _**Tests**_
 

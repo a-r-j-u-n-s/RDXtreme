@@ -31,7 +31,7 @@ enum Test {
     RandomWriteCycle
 }
 
-// TODO: wrap virtualalloc in struct with drop, better memcpy comparisons, GET RID OF WRITEONLY DEFAULT
+// TODO: wrap virtualalloc in struct with drop
 
 fn main() {
     // Refresh system information so drives are up to date
@@ -129,6 +129,11 @@ fn main() {
             .long("controller")
             .takes_value(false)
             .help("Display identify controller information for NVMe device"))
+        .arg(Arg::new("namespace")
+            .short('N')
+            .long("namespace")
+            .takes_value(false)
+            .help("Display identify namespace information for NVMe device"))
         .get_matches();
 
     let partitions: u8;
@@ -210,6 +215,12 @@ fn main() {
         let path = &format_drive_num(disk_number);
         let handle: Foundation::HANDLE = open_handle(path, 'w').unwrap();
         id_controller(handle);
+    }
+
+    if args.is_present("namespace") {
+        let path = &format_drive_num(disk_number);
+        let handle: Foundation::HANDLE = open_handle(path, 'w').unwrap();
+        id_namespace(handle);
     }
 
     if args.is_present("test") {
@@ -1250,7 +1261,7 @@ fn set_thread_group(group: GROUP_AFFINITY) {
     }
 }
 
-// TODO: Retrieve Identify Controller information 
+
 #[allow(unused)]
 fn id_controller(h_device: Foundation::HANDLE) {
     let status: u32;
@@ -1325,6 +1336,73 @@ fn id_controller(h_device: Foundation::HANDLE) {
     
 }
 
+#[allow(unused)]
+fn id_namespace(h_device: Foundation::HANDLE) {
+    let status: u32;
+
+    // Buffer must be big enough to cintain both a STORAGE_PROPERTY_QUERY and a STORAGE_PROTOCOL_SPECIFIC_DATA structure
+    let storage_property_query_offset = field_offset::offset_of!(Ioctl::STORAGE_PROPERTY_QUERY => AdditionalParameters).get_byte_offset();
+    let buffer_length: usize = storage_property_query_offset + size_of::<Ioctl::STORAGE_PROTOCOL_SPECIFIC_DATA>() + NVME_MAX_LOG_SIZE as usize;
+
+    let mut returned_length: u32 = 0;
+    let returned_length_ptr: *mut u32 = &mut returned_length as *mut u32;
+
+    // Allocate sector-aligned buffer with Win32 VirtualAlloc
+    let buf: LPVOID = unsafe {
+        VirtualAlloc(
+            null_mut(),
+            buffer_length as usize,
+            MEM_COMMIT | MEM_RESERVE,
+            PAGE_EXECUTE_READWRITE
+        )
+    };
+    let buffer_ptr_raw: *mut u8 = std::ptr::slice_from_raw_parts_mut(buf, buffer_length as usize / std::mem::size_of::<u8>()) as *mut u8;
+
+    unsafe {
+        let query_ptr: *mut Ioctl::STORAGE_PROPERTY_QUERY = std::mem::transmute::<*mut u8, *mut Ioctl::STORAGE_PROPERTY_QUERY>(buffer_ptr_raw);
+        let query: &mut Ioctl::STORAGE_PROPERTY_QUERY = &mut *query_ptr;
+
+        let protocol_data_ptr: *mut Ioctl::STORAGE_PROTOCOL_SPECIFIC_DATA = std::mem::transmute::<*mut u8, *mut Ioctl::STORAGE_PROTOCOL_SPECIFIC_DATA>(query.AdditionalParameters.as_mut_ptr());
+        let protocol_data: &mut Ioctl::STORAGE_PROTOCOL_SPECIFIC_DATA = &mut *protocol_data_ptr;
+        
+        
+        query.PropertyId = Ioctl::StorageAdapterProtocolSpecificProperty;
+        query.QueryType = Ioctl::PropertyStandardQuery;
+
+        protocol_data.ProtocolType = Ioctl::ProtocolTypeNvme;
+        protocol_data.DataType = 1;     // Ioctl::NVMeDataTypeIdentify is not implemented correctly, so use simple 
+        protocol_data.ProtocolDataRequestValue = 0;     // NVME_IDENTIFY_CNS_SPECIFIC_NAMESPACE
+        protocol_data.ProtocolDataRequestSubValue = 1;
+        protocol_data.ProtocolDataOffset = size_of::<Ioctl::STORAGE_PROTOCOL_SPECIFIC_DATA>() as u32;
+        protocol_data.ProtocolDataLength = NVME_MAX_LOG_SIZE;
+
+        let result: Foundation::BOOL = DeviceIoControl(h_device,
+            Ioctl::IOCTL_STORAGE_QUERY_PROPERTY,
+            buf,
+            buffer_length as u32,
+            buf,
+            buffer_length as u32,
+        returned_length_ptr,
+            null_mut()
+        );
+
+        if !result.as_bool() || (returned_length == 0) {
+            status = win32::last_error();
+            error!("Get Identify Namespace Data failed. Error Code {}", status);
+            exit(1);
+        }
+    
+        let write_buffer_ptr_raw: *mut [u8] = std::ptr::slice_from_raw_parts_mut(buf, buffer_length as usize / std::mem::size_of::<u8>()) as *mut [u8];
+        let write_buf: &mut [u8];
+        let buf_ptr: *mut [u8] = write_buffer_ptr_raw as *mut [u8];
+        write_buf = &mut *buf_ptr;
+
+        // Parse byte output
+        parse_namespace_buffer(write_buf, protocol_data.ProtocolDataOffset as usize + storage_property_query_offset as usize);
+    }
+    
+}
+
 
 // Parse the output of the Identify Controller NVMe information
 #[allow(non_snake_case)]
@@ -1383,4 +1461,12 @@ fn parse_controller_buffer(buffer: &mut [u8], offset: usize) {
      }
      println!("Version (VER): {}", VER);
 
+}
+
+// Parse the output of the Identify Controller NVMe information
+#[allow(non_snake_case)]
+fn parse_namespace_buffer(buffer: &mut [u8], offset: usize) {
+    for i in offset..offset + 84 {
+        debug!("{}: {:#02X}", i, buffer[i as usize]);
+    }
 }
