@@ -28,4 +28,5 @@ features = [
     "Win32_System_Threading",
     "Win32_Storage_FileSystem",
     "Win32_System_Ioctl",
+    "Win32_Storage_IscsiDisc"
 ]

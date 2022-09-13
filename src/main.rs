@@ -1,5 +1,5 @@
 use windows_drives::{drive::{PhysicalDrive, DiskGeometry}, win32};
-use windows::{core::PCWSTR, Win32::{Storage::FileSystem, Foundation, System::{Ioctl, IO::DeviceIoControl}}};
+use windows::{core::PCWSTR, Win32::{Storage::{FileSystem, IscsiDisc}, Foundation, System::{Ioctl, IO::DeviceIoControl}}};
 use sysinfo::SystemExt;
 use powershell_script;
 use clap::Arg;
@@ -9,8 +9,7 @@ use affinity::*;
 use std::num::ParseIntError;
 use log::{debug, error, warn, info};
 use json::{object, JsonValue};
-use std::fs::{File, remove_file};
-use std::io::prelude::*;
+use std::{fs::{File, remove_file}, io::prelude::*, collections::HashMap};
 use rand::Rng;
 
 // Sector aligned buffer size constants
@@ -128,29 +127,34 @@ fn main() {
             .short('C')
             .long("controller")
             .takes_value(false)
-            .help("Display identify controller information for NVMe device"))
+            .help("Display identify controller information for chosen NVMe device"))
         .arg(Arg::new("namespace")
             .short('N')
             .long("namespace")
             .takes_value(false)
-            .help("Display identify namespace information for NVMe device"))
+            .help("Display identify namespace information for chosen NVMe device"))
+        .arg(Arg::new("firmware")
+            .short('F')
+            .long("firmware")
+            .takes_value(false)
+            .help("Display firmware information for chosen NVMe device"))
         .get_matches();
 
-    let partitions: u8;
-    let mut pattern_str: String = String::from("0123456789abcdef");     // Default 64-bit pattern for conducting I/O data comparisons
-    let pattern: u64;
-    let mut compare_pattern: bool = true;
-    let disk_number: u8;
-    let mut buffer_size: u64 = MEGABYTE;    // Defaulyt buffer size
-    let mut buffer_size_str: &str = "1m";
-    let mut threads: u64 = 1;
+    let partitions: u8;     // Number of partitions on the drive
+    let mut pattern_str: String = String::from("0123456789abcdef");     // Default 64-bit data pattern to write/compare
+    let pattern: u64;       // Data pattern to be written/compared to
+    let mut compare_pattern: bool = true;       // Enable/disable data comparison during I/O tests
+    let disk_number: u8;        // ID of the physical disk
+    let mut buffer_size: u64 = MEGABYTE;    // Default buffer size
+    let mut buffer_size_str: &str = "1m";       // Buffer size for reads/writes
+    let mut threads: u64 = 1;       // Number of threads to spawn and split operations across
     let mut multiple_groups: bool = false;
     let io_type: char;      // Identifier for opening handle and conducting IO
-    let mut log_type: &str = "info";
+    let mut log_type: &str = "info";        // Logging type
     let mut iterations: u64 = 1;    // Number of times to run I/O operations
     let mut id_json: JsonValue = json::JsonValue::new_array();
-    let mut time: u64 = 0;
-    let mut test: Test = Test::WriteOnly;
+    let mut time: u64 = 0;      // Time before stopping operations
+    let mut test: Test = Test::WriteOnly;       // Data comparison test
     let mut hold_time: u32 = 0;     // Time to run random read/compare
     let mut delay_time: u32 = 0;    // Time before starting next read/compare cycle
 
@@ -180,6 +184,7 @@ fn main() {
                     .hidden(false)
                     .print_commands(false)
                     .build();
+                // Run PowerShell script and parse output
                 let output = ps.run(r#"
                     $DiskInfo = Get-Content ./disk_info.json | ConvertFrom-Json
                     foreach ($Disk in $DiskInfo) {
@@ -211,16 +216,20 @@ fn main() {
         exit(0);
     }
 
+    let path = &format_drive_num(disk_number);
+    let handle: Foundation::HANDLE = open_handle(path, 'w').unwrap();
+
     if args.is_present("controller") {
-        let path = &format_drive_num(disk_number);
-        let handle: Foundation::HANDLE = open_handle(path, 'w').unwrap();
+        
         id_controller(handle);
     }
 
     if args.is_present("namespace") {
-        let path = &format_drive_num(disk_number);
-        let handle: Foundation::HANDLE = open_handle(path, 'w').unwrap();
         id_namespace(handle);
+    }
+
+    if args.is_present("firmware") {
+        get_firmware_info(handle);
     }
 
     if args.is_present("test") {
@@ -401,7 +410,7 @@ fn get_partitions(disk_number: u8) -> u8 {
 }
 
 
-// Leverage Win32 to open a physical drive handle for reads/writes
+// Use Win32 functions to open a physical drive handle for reads/writes
 fn open_handle(path: &str, handle_type: char) -> Result<Foundation::HANDLE, String> {
     let path = win32::win32_string(&path);
     let handle_template = Foundation::HANDLE(0);    // Generic hTemplate needed for CreateFileW
@@ -906,7 +915,8 @@ fn conduct_data_comparison(sender: std::sync::mpsc::Sender<String>, num_threads:
             }
             
         }
-        if test == Test::ReadCompare || test == Test::RandomReads {      // These tests test should not repeat the initial write
+        // These tests test should not repeat the initial write, so break the loop
+        if test == Test::ReadCompare || test == Test::RandomReads {
             break;
         }
         i += 1;
@@ -964,10 +974,6 @@ fn bit_shift(data: u64, iterations: u64) -> u64 {
     data.rotate_right(bit_count.try_into().unwrap())
 }
 
-fn parse_hex(src: &str) -> Result<u64, ParseIntError> {
-    u64::from_str_radix(src, 16)
-}
-
 
 // Calculates sector size and adds it to JSON object
 fn get_physicaldisk(device_obj: &mut JsonValue, physical_number: u8) {
@@ -978,7 +984,9 @@ fn get_physicaldisk(device_obj: &mut JsonValue, physical_number: u8) {
     device_obj["Sector Size"] = sector_size.into();
 }
 
-fn get_firmware_info(device_obj: &mut JsonValue, unique_id: &str) {
+
+// Parse the output of the PowerShell script (Get-StorageFirmwareInformation)
+fn get_storage_firmware_info(device_obj: &mut JsonValue, unique_id: &str) {
     let ps_script = format!("
     $FormatEnumerationLimit = -1
     Get-StorageFirmwareInformation -UniqueId {} | Select-Object FirmwareVersionInSlot | Format-List", unique_id);
@@ -999,6 +1007,7 @@ fn get_firmware_info(device_obj: &mut JsonValue, unique_id: &str) {
     }
     
 }
+
 
 // Parse the output of the PowerShell script (Get-PhysicalDisk)
 fn parse_script(stdout: &str, id_json: &mut JsonValue) { 
@@ -1029,7 +1038,7 @@ fn parse_script(stdout: &str, id_json: &mut JsonValue) {
                                 }
                             } else if identifier == "UniqueId" {
                                 let unique_id: &str = item;
-                                get_firmware_info(&mut device_obj, unique_id);
+                                get_storage_firmware_info(&mut device_obj, unique_id);
                             }
                             identifier = "";
                         }
@@ -1048,6 +1057,7 @@ fn split_char(c: char) -> bool {
 }
 
 
+// Converts user input to appropriate size in bytes
 fn get_buffer_size(input: &str) -> u64 {
     match input {
         "512b" => {
@@ -1101,8 +1111,10 @@ fn get_buffer_size(input: &str) -> u64 {
 }
 
 
+
+// Identifies which data comparison test the program should run
 fn select_test_type(id: u8) -> Test {
-    match id {      // Change this
+    match id {
         0 => {
             info!("Test: Any Pattern Full Write No Comparison - i*[>W]");
             return Test::WriteOnly;
@@ -1266,13 +1278,6 @@ fn set_thread_group(group: GROUP_AFFINITY) {
 fn id_controller(h_device: Foundation::HANDLE) {
     let status: u32;
 
-    /*
-    - Allocate a buffer that can contains both a STORAGE_PROPERTY_QUERY and a STORAGE_PROTOCOL_SPECIFIC_DATA structure.
-    - Set the PropertyID field to StorageAdapterProtocolSpecificProperty or StorageDeviceProtocolSpecificProperty for a controller or device/namespace request, respectively.
-    - Set the QueryType field to PropertyStandardQuery.
-    - Fill the STORAGE_PROTOCOL_SPECIFIC_DATA structure with the desired values. The start of the STORAGE_PROTOCOL_SPECIFIC_DATA is the AdditionalParameters field of STORAGE_PROPERTY_QUERY.
-    */
-
     // Buffer must be big enough to cintain both a STORAGE_PROPERTY_QUERY and a STORAGE_PROTOCOL_SPECIFIC_DATA structure
     let storage_property_query_offset = field_offset::offset_of!(Ioctl::STORAGE_PROPERTY_QUERY => AdditionalParameters).get_byte_offset();
     let buffer_length: usize = storage_property_query_offset + size_of::<Ioctl::STORAGE_PROTOCOL_SPECIFIC_DATA>() + NVME_MAX_LOG_SIZE as usize;
@@ -1404,37 +1409,124 @@ fn id_namespace(h_device: Foundation::HANDLE) {
 }
 
 
+fn get_firmware_info(h_device: Foundation::HANDLE) {
+    let status: u32;
+
+    // The STORAGE_FIRMWARE_INFO is located after SRB_IO_CONTROL and FIRMWARE_REQUEST_BLOCK
+    let firmware_structure_offset = ((size_of::<IscsiDisc::SRB_IO_CONTROL>() + size_of::<IscsiDisc::FIRMWARE_REQUEST_BLOCK>() - 1) / size_of::<LPVOID>() + 1) * size_of::<LPVOID>();
+    let mut buffer_length: usize = 2 * 1024 * 1024;
+    buffer_length += firmware_structure_offset;
+    buffer_length += field_offset::offset_of!(IscsiDisc::STORAGE_FIRMWARE_DOWNLOAD => ImageBuffer).get_byte_offset();
+
+    let mut returned_length: u32 = 0;
+    let returned_length_ptr: *mut u32 = &mut returned_length as *mut u32;
+
+    // Allocate sector-aligned buffer with Win32 VirtualAlloc
+    let buf: LPVOID = unsafe {
+        VirtualAlloc(
+            null_mut(),
+            buffer_length as usize,
+            MEM_COMMIT | MEM_RESERVE,
+            PAGE_EXECUTE_READWRITE
+        )
+    };
+    let buffer_ptr_raw: *mut u8 = std::ptr::slice_from_raw_parts_mut(buf, buffer_length as usize / std::mem::size_of::<u8>()) as *mut u8;
+
+    unsafe {
+        let srb_control_ptr: *mut IscsiDisc::SRB_IO_CONTROL = std::mem::transmute::<*mut u8, *mut IscsiDisc::SRB_IO_CONTROL>(buffer_ptr_raw);
+        let srb_control: &mut IscsiDisc::SRB_IO_CONTROL = &mut *srb_control_ptr;
+
+        let firmware_request_ptr: *mut IscsiDisc::FIRMWARE_REQUEST_BLOCK = std::mem::transmute::<*mut IscsiDisc::SRB_IO_CONTROL, *mut IscsiDisc::FIRMWARE_REQUEST_BLOCK>(srb_control_ptr.offset(1));
+        let firmware_request: &mut IscsiDisc::FIRMWARE_REQUEST_BLOCK = &mut *firmware_request_ptr;
+
+        // Set up the SRB control w/ firmware ioctl info
+        srb_control.HeaderLength = size_of::<IscsiDisc::SRB_IO_CONTROL>() as u32;
+        srb_control.ControlCode = IscsiDisc::IOCTL_SCSI_MINIPORT;
+        srb_control.Signature = [0; 8];//IscsiDisc::IOCTL_MINIPORT_SIGNATURE_FIRMWARE;
+        srb_control.Timeout = 30;
+        srb_control.Length = buffer_length as u32 - size_of::<IscsiDisc::SRB_IO_CONTROL>() as u32;
+
+
+        // Set firmware request fields for FIRMWARE_FUNCTION_GET_INFO. This request is to the controller so
+        // FIRMWARE_REQUEST_FLAG_CONTROLLER is set in the flags
+        firmware_request.Version = IscsiDisc::FIRMWARE_REQUEST_BLOCK_STRUCTURE_VERSION;
+        firmware_request.Size = size_of::<IscsiDisc::FIRMWARE_REQUEST_BLOCK>() as u32;
+        firmware_request.Function = IscsiDisc::FIRMWARE_FUNCTION_GET_INFO;
+        firmware_request.Flags = IscsiDisc::FIRMWARE_REQUEST_FLAG_CONTROLLER;
+        firmware_request.DataBufferOffset = firmware_structure_offset as u32;
+        firmware_request.DataBufferLength = (buffer_length - firmware_structure_offset) as u32;
+
+        let result: Foundation::BOOL = DeviceIoControl(h_device,
+            IscsiDisc::IOCTL_SCSI_MINIPORT,
+            buf,
+            buffer_length as u32,
+            buf,
+            buffer_length as u32,
+        returned_length_ptr,
+            null_mut()
+        );
+
+        if !result.as_bool() || (returned_length == 0) {
+            status = win32::last_error();
+            error!("Get Firmware Data failed. Error Code {}", status);
+            exit(1);
+        }
+    
+        let write_buffer_ptr_raw: *mut [u8] = std::ptr::slice_from_raw_parts_mut(buf, buffer_length as usize / std::mem::size_of::<u8>()) as *mut [u8];
+        let write_buf: &mut [u8];
+        let buf_ptr: *mut [u8] = write_buffer_ptr_raw as *mut [u8];
+        write_buf = &mut *buf_ptr;
+
+        // Parse byte output
+    }
+}
+
+
 // Parse the output of the Identify Controller NVMe information
 #[allow(non_snake_case)]
 fn parse_controller_buffer(buffer: &mut [u8], offset: usize) {
+
+    // List of Vendor ID mappings (subject to change)
+    let vendors = HashMap::from([
+        ("0x1C5C".to_string(), "Hynix".to_string()),
+        ("0x144D".to_string(), "Samsung".to_string()),
+        ("0x101C".to_string(), "WDC".to_string()),
+        ("0x1344".to_string(), "Micron".to_string()),
+        ("0x1E0F".to_string(), "Kioxia".to_string())
+    ]);
+
     for i in offset..offset + 84 {
         debug!("{}: {:#02X}", i, buffer[i as usize]);
     }
 
-    // Print Vendor ID
+    // Print Vendor
     let VID = format!("{:#02X}{:02X}", buffer[offset + 1], buffer[offset]);
-    println!("PCI Vendor ID (VID): {}", VID);
+    println!("Vendor: {}", vendors.get(&VID).unwrap());
 
     // Print SS Vendor ID
     let SSVID = format!("{:#02X}{:02X}", buffer[offset + 3], buffer[offset + 2]);
     println!("PCI Subsystem Vendor ID (SSVID): {}", SSVID);
 
     // Print Serial Number
-    let mut SN = format!("{:#02X}", buffer[offset + 4]);
-    for i in offset + 5..offset + 23 {
-        SN += &format!("{:02X}", buffer[offset + i]);
+    // let mut SN = String::from("0x");
+    let mut SN: String = String::from("");
+    for i in (offset + 4..offset + 23).rev() {
+        // SN += &format!("{:02X}", buffer[offset + i]);
+        SN += &(buffer[offset + i] as char).to_string();
     }
     println!("Serial Number (SN): {}", SN);
 
     // Print Model Number
-    let mut MN = format!("{:#02X}", buffer[offset + 24]);
-    for i in offset + 25..offset + 63 {
-        MN += &format!("{:02X}", buffer[offset + i]);
+    // let mut MN = String::from("0x");
+    let mut MN = String::from("");
+    for i in (offset + 24..offset + 63).rev() {
+        // MN += &format!("{:02X}", buffer[offset + i]);
+        MN += &(buffer[offset + i] as char).to_string();
     }
     println!("Model Number (MN): {}", MN);
 
     // Print Firmware Revision
-    let mut FR = format!("{:#02X}", buffer[offset + 64]);
+    let mut FR = String::from("0x");
     for i in offset + 65..offset + 71 {
         FR += &format!("{:02X}", buffer[offset + i]);
     }
@@ -1448,25 +1540,77 @@ fn parse_controller_buffer(buffer: &mut [u8], offset: usize) {
     println!("IEEE OUI Identifier: {}", IEEE);
 
     // Print Maximum Data Transfer Size
-    println!("Maximum Data Transfer Size (MDTS): {:#02X}", buffer[offset + 77]);
+    println!("Maximum Data Transfer Size (MDTS): 2^{}", buffer[offset + 77]);
 
     // Print Controller ID
-    let CNTLID = format!("{:#02X}{:02X}", buffer[offset + 79], buffer[offset + 78]);
-    println!("Controller ID (CNTLID): {}", CNTLID);
+    let CNTLID = format!("{:02X}{:02X}", buffer[offset + 79], buffer[offset + 78]);
+    println!("Controller ID (CNTLID): {}", parse_hex(&CNTLID).unwrap());
 
      // Print Version
-     let mut VER = format!("{:#02X}", buffer[offset + 80]);
-     for i in offset + 81..offset + 83 {
+     let mut VER = String::from("");
+     for i in (offset + 80..offset + 83).rev() {
          VER += &format!("{:02X}", buffer[offset + i]);
      }
-     println!("Version (VER): {}", VER);
+     println!("Version (VER): {}", parse_hex(&VER).unwrap());
 
 }
 
 // Parse the output of the Identify Controller NVMe information
 #[allow(non_snake_case)]
 fn parse_namespace_buffer(buffer: &mut [u8], offset: usize) {
-    for i in offset..offset + 84 {
+    for i in offset..offset + 131 {
         debug!("{}: {:#02X}", i, buffer[i as usize]);
     }
+
+    // Print Namespace Size
+    let mut NSZE = String::from("");
+    for i in (offset + 0..offset + 7).rev() {
+        NSZE += &format!("{:02X}", buffer[offset + i]);
+    }
+    println!("Namespace Size (NSZE): {} blocks", parse_hex(&NSZE).unwrap());
+
+    // Print Namespace Capacity
+    let mut NCAP = String::from("");
+    for i in (offset + 8..offset + 15).rev() {
+        NCAP += &format!("{:02X}", buffer[offset + i]);
+    }
+    println!("Namespace Capacity (NCAP): {} blocks", parse_hex(&NCAP).unwrap());
+
+    // Print Namespace Utilization
+    let mut NUSE = String::from("");
+    for i in (offset + 16..offset + 23).rev() {
+        NUSE += &format!("{:02X}", buffer[offset + i]);
+    }
+    println!("Namespace Utilization (NSZE): {} blocks", parse_hex(&NUSE).unwrap());
+
+    // Print Number of LBA Formats
+    let NLBAF = format!("{:02X}", buffer[offset + 25]);
+    println!("Number of LBA Formats Supported (NLBAF): {}", parse_hex(&NLBAF).unwrap());
+
+    // Print Namepace Preferred Write Alignment
+    let NPWA = format!("{:02X}{:02X}", buffer[offset + 66], buffer[offset + 67]);
+    println!("Namespace Preferred Write Alignment (NPWA): {}", parse_hex(&NPWA).unwrap());
+
+    // Print Namespace Globally Unique Identifier
+    let mut NGUID = String::from("");
+    for i in (offset + 104..offset + 119).rev() {
+        NGUID += &format!("{:02X}", buffer[offset + i]);
+    }
+    println!("Namespace Globally Unique Identifier (NGUID): {}", NGUID);
+
+
+    // Print Namespace Utilization
+    let mut LBAF0 = String::from("");
+    for i in (offset + 128..offset + 131).rev() {
+        LBAF0 += &format!("{:02X}", buffer[offset + i]);
+    }
+    println!("LBA Format 0 Support (LBAF0): {}", parse_hex(&LBAF0).unwrap());
+
+
+}
+
+
+// Convert hex string to u64
+fn parse_hex(src: &str) -> Result<u64, ParseIntError> {
+    u64::from_str_radix(src, 16)
 }
