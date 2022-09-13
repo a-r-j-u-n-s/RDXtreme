@@ -53,6 +53,8 @@ This CLI allows you to run multithreaded read/write operations and data comparis
 
 `-b/--buffer [SIZE]` : Buffer/IO operation size (512b, 1k, 2k, 4k, 8k, 16k, 32k, 64k, 128k, 256k, 512k, 1m, 2m, 4m)
 
+`-x/--trigger` : Exit/pattern trigger for the I/O test (more information below)
+
 `--time [LENGTH]` : Time limit (s) before program exits
 
 `-h/--hold` : Time (s) to run each random read for (only for specific test cases)
@@ -100,6 +102,21 @@ This CLI allows you to run multithreaded read/write operations and data comparis
 ```Any Pattern 64 Bit Random Write/Read/Compare - T*[>ww,r,c]```
 
 - Write, read, and compare full data pattern at random addresses
+
+## _**Triggers**_
+
+### **0. Default**
+
+- Run operations normally
+
+### **1. Exit on Error**
+
+- Stop all threads on any I/O, miscompare or other error
+
+### **2. Triggering Data Pattern**
+
+- Write `0xEFBEADDEADDEADDE` once to the LBA at the 4 KB offset before conducting I/O operations
+
 
 
 ## _**Use Cases**_

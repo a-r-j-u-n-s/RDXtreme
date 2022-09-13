@@ -16,7 +16,7 @@ use rand::Rng;
 const MEGABYTE: u64 = 1048576;
 const GIGABYTE: u64 = 1073741824;
 const PAGE_SIZE: u64 = 4096;
-const INITIALIZATION_OFFSET: u64 = 4096;
+const INITIALIZATION_OFFSET: u64 = 4096 * 2;    // Offset to start writes
 
 const NVME_MAX_LOG_SIZE: u32 = 0x1000;
 
@@ -30,7 +30,13 @@ enum Test {
     RandomWriteCycle
 }
 
-// TODO: wrap virtualalloc in struct with drop
+// Trigger Type
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum Trigger {
+    Default,
+    ExitOnError,
+    TriggerPattern
+}
 
 fn main() {
     // Refresh system information so drives are up to date
@@ -123,6 +129,11 @@ fn main() {
             .long("debug")
             .takes_value(false)
             .help("Display debug information in log output"))
+        .arg(Arg::new("trigger")
+            .short('x')
+            .long("trigger")
+            .takes_value(true)
+            .help("Triggering data pattern to write at first 4 KB\n0. Default\n1. Exit on any Error\n2. Write 0xEFBEADDEADDEADDE to 4 KB offset"))
         .arg(Arg::new("controller")
             .short('C')
             .long("controller")
@@ -143,6 +154,7 @@ fn main() {
     let partitions: u8;     // Number of partitions on the drive
     let mut pattern_str: String = String::from("0123456789abcdef");     // Default 64-bit data pattern to write/compare
     let pattern: u64;       // Data pattern to be written/compared to
+    let mut trigger: Trigger = Trigger::Default;
     let mut compare_pattern: bool = true;       // Enable/disable data comparison during I/O tests
     let disk_number: u8;        // ID of the physical disk
     let mut buffer_size: u64 = MEGABYTE;    // Default buffer size
@@ -192,7 +204,7 @@ fn main() {
                         [array]$Partitions = Get-Partition $DiskNumber
                         $Disk | Add-Member -MemberType NoteProperty -Name 'Partitions' -Value ($Partitions.count)
                     }
-                    $Table = $DiskInfo | Format-Table 'DeviceId', 'FriendlyName', 'SerialNumber', 'MediaType', 'Partitions', 'Sector Size', 'Firmware Version'
+                    $Table = $DiskInfo | Format-Table 'DeviceId', 'FriendlyName', 'SerialNumber', 'MediaType', 'Partitions', 'Sector Size'
                     Write-Output $Table
                 "#).unwrap();
                 println!("Physical Drive Information:\n{}", output.stdout().unwrap());
@@ -220,7 +232,6 @@ fn main() {
     let handle: Foundation::HANDLE = open_handle(path, 'w').unwrap();
 
     if args.is_present("controller") {
-        
         id_controller(handle);
     }
 
@@ -247,6 +258,11 @@ fn main() {
         exit(0);
     }
 
+    if args.is_present("trigger") {
+        let id: u8 = args.value_of("trigger").unwrap().parse().expect("Trigger ID must be a valid integer");
+        trigger = select_trigger_type(id);
+    }
+
     if args.is_present("iterations") {
         iterations = args.value_of("iterations").unwrap().parse().expect("Number of iterations must be a positive integer");
         info!("Operations will loop {} times", iterations);
@@ -265,6 +281,7 @@ fn main() {
             exit(1);
         }
     }
+
     if args.is_present("buffer") {
         buffer_size_str = args.value_of("buffer").unwrap();
         buffer_size = get_buffer_size(buffer_size_str);
@@ -321,7 +338,6 @@ fn main() {
             info!("Serial Number: {}", &device["SerialNumber"]);
             info!("Size: {} bytes", size);
             info!("Media Type: {}", &device["MediaType"]);
-            info!("Firmware Version: {}", &device["Firmware Version"]);
             break;
         }
     }    
@@ -367,9 +383,9 @@ fn main() {
             
             // Run chosen I/O operation
             if (io_type == 'r' && !compare_pattern) || io_type == 'w' {
-                conduct_io_operation(sen_clone, disk_number, num_threads, threads.clone(), buffer_size, limit, io_type, pattern, iterations, time);
+                conduct_io_operation(sen_clone, disk_number, num_threads, threads.clone(), buffer_size, limit, io_type, pattern, iterations, time, trigger);
             } else {
-                conduct_data_comparison(sen_clone, num_threads, threads.clone(), disk_number, pattern, limit, sector_size, buffer_size, iterations, time, test, compare_pattern, io_type, hold_time, delay_time);
+                conduct_data_comparison(sen_clone, num_threads, threads.clone(), disk_number, pattern, limit, sector_size, buffer_size, iterations, time, test, compare_pattern, io_type, hold_time, delay_time, trigger);
             }
         });
         threads -= 1;
@@ -455,7 +471,7 @@ fn open_handle(path: &str, handle_type: char) -> Result<Foundation::HANDLE, Stri
 }
 
 // Conduct threaded IO operation (read/write)
-fn conduct_io_operation(sender: std::sync::mpsc::Sender<String>, disk_number: u8, num_threads: u64, id: u64, buffer_size: u64, size: u64, io_type: char, pattern: u64, loops: u64, time: u64) {
+fn conduct_io_operation(sender: std::sync::mpsc::Sender<String>, disk_number: u8, num_threads: u64, id: u64, buffer_size: u64, size: u64, io_type: char, pattern: u64, loops: u64, time: u64, trigger: Trigger) {
     let mut initialization_offset = 0;
     if io_type == 'w' {   // Add 4 KB offset to all operations to avoid overwriting drive
         initialization_offset = INITIALIZATION_OFFSET;
@@ -485,6 +501,62 @@ fn conduct_io_operation(sender: std::sync::mpsc::Sender<String>, disk_number: u8
         )
     };
 
+    // Keep track of bytes written/read
+    let mut bytes_completed: u32 = 0;
+    let bytes_completed_ptr: *mut u32 = &mut bytes_completed;
+
+    if io_type == 'w' {
+        // Set up references for write buffer and copy pattern data into buffer 
+        let write_buffer_ptr_raw: *mut [u64] = std::ptr::slice_from_raw_parts_mut(buffer, buffer_size as usize / std::mem::size_of::<u64>()) as *mut [u64];
+        let write_buf: &mut [u64];
+
+        // Dereference buffer to add pattern data
+        unsafe {
+            let buf_ptr: *mut [u64] = write_buffer_ptr_raw as *mut [u64];
+            write_buf = &mut *buf_ptr;
+
+            // If we are at the first thread, write the triggering data pattern to the 4 KB offset
+            if trigger == Trigger::TriggerPattern && id == 1 {
+                let trigger_pattern = parse_hex("EFBEADDEADDEADDE").unwrap();
+                let trigger_data: Vec<u64> = vec![trigger_pattern; buffer_size as usize / std::mem::size_of::<u64>()];
+                
+                // Move file pointer to 4 KB offset
+                let _pointer = {
+                    FileSystem::SetFilePointerEx(
+                        handle,
+                        PAGE_SIZE as i64,
+                        null_mut(),
+                        FileSystem::FILE_BEGIN
+                    )
+                };
+                write_buf.copy_from_slice(&trigger_data);
+
+                // Write triggering pattern
+                let write =  {
+                    FileSystem::WriteFile(
+                        handle,
+                        buffer,
+                        buffer_size as DWORD,
+                        bytes_completed_ptr,
+                        null_mut()
+                    )
+                };
+                if write == false {
+                    error!("Thread {} encountered Error Code {}", id, win32::last_error());
+                    if trigger == Trigger::ExitOnError {
+                        // Clean up resources and close handle
+                        {
+                            VirtualFree(buffer, 0, MEM_RELEASE);
+                            Foundation::CloseHandle(handle);
+                        }
+                        return;
+                    }
+                }
+            }    
+            write_buf.copy_from_slice(&pattern_data);
+        }
+    }
+
     let mut i: u64 = 0;
     while i < loops {
         let _pointer = unsafe {
@@ -497,22 +569,10 @@ fn conduct_io_operation(sender: std::sync::mpsc::Sender<String>, disk_number: u8
         };
         
         // I/O logistics
-        let mut bytes_completed: u32 = 0;
-        let bytes_completed_ptr: *mut u32 = &mut bytes_completed;
         let mut pos: u64 = offset;
         let last_pos: u64 = local_limit * id - buffer_size;
 
         if io_type == 'w' {
-            // Set up references for write buffer and copy pattern data into buffer 
-            let write_buffer_ptr_raw: *mut [u64] = std::ptr::slice_from_raw_parts_mut(buffer, buffer_size as usize / std::mem::size_of::<u64>()) as *mut [u64];
-            let write_buf: &mut [u64];
-
-            // Dereference buffer to add pattern data
-            unsafe {
-                let buf_ptr: *mut [u64] = write_buffer_ptr_raw as *mut [u64];
-                write_buf = &mut *buf_ptr;
-                write_buf.copy_from_slice(&pattern_data);
-            }
             now = Instant::now();
             while pos <= last_pos {
                 let write = unsafe {
@@ -527,6 +587,14 @@ fn conduct_io_operation(sender: std::sync::mpsc::Sender<String>, disk_number: u8
                 pos += bytes_completed as u64;
                 if write == false {
                     error!("Thread {} encountered Error Code {}", id, win32::last_error());
+                    if trigger == Trigger::ExitOnError {
+                        // Clean up resources and close handle
+                        unsafe {
+                            VirtualFree(buffer, 0, MEM_RELEASE);
+                            Foundation::CloseHandle(handle);
+                        }
+                        return;
+                    }
                     break;
                 }
                 if time > 0 && now.elapsed().as_secs() > time {
@@ -550,6 +618,14 @@ fn conduct_io_operation(sender: std::sync::mpsc::Sender<String>, disk_number: u8
                 pos += bytes_completed as u64;
                 if read == false { 
                     error!("Thread {} encountered Error Code {}", id, win32::last_error());
+                    if trigger == Trigger::ExitOnError {
+                        // Clean up resources and close handle
+                        unsafe {
+                            VirtualFree(buffer, 0, MEM_RELEASE);
+                            Foundation::CloseHandle(handle);
+                        }
+                        return;
+                    }
                     break;
                 }
                 if time > 0 && now.elapsed().as_secs() > time {
@@ -571,7 +647,7 @@ fn conduct_io_operation(sender: std::sync::mpsc::Sender<String>, disk_number: u8
 
 
 // Multithreaded write/compare data patterns
-fn conduct_data_comparison(sender: std::sync::mpsc::Sender<String>, num_threads: u64, id: u64, disk_number: u8, mut original_pattern: u64, size: u64, _sector_size: u64, buffer_size: u64, loops: u64, time: u64, test: Test, compare_pattern: bool, io_type: char, hold_time: u32, delay_time: u32) {
+fn conduct_data_comparison(sender: std::sync::mpsc::Sender<String>, num_threads: u64, id: u64, disk_number: u8, mut original_pattern: u64, size: u64, _sector_size: u64, buffer_size: u64, loops: u64, time: u64, test: Test, compare_pattern: bool, io_type: char, hold_time: u32, delay_time: u32, trigger: Trigger) {
     let mut pattern = original_pattern;     // For data comparisons
     let local_limit = calculate_nearest_multiple(PAGE_SIZE, size / num_threads);     // Align full IO size
     let path = format_drive_num(disk_number);
@@ -596,12 +672,58 @@ fn conduct_data_comparison(sender: std::sync::mpsc::Sender<String>, num_threads:
         )
     };
 
+    // Keep track bytes completed
+    let mut bytes_completed: u32 = 0;
+    let bytes_completed_ptr: *mut u32 = &mut bytes_completed;
+
     // Set up references for write buffer and copy pattern data into buffer 
     let write_buffer_ptr_raw: *mut [u64] = std::ptr::slice_from_raw_parts_mut(write_buffer, buffer_size as usize / std::mem::size_of::<u64>()) as *mut [u64];
     let write_buf: &mut [u64];
     unsafe {
+
+        // Dereference buffer to add pattern data
         let buf_ptr: *mut [u64] = write_buffer_ptr_raw as *mut [u64];
         write_buf = &mut *buf_ptr;
+
+        // If we are at the first thread, write the triggering data pattern to the 4 KB offset
+        if trigger == Trigger::TriggerPattern && id == 1 {
+            let trigger_pattern = parse_hex("EFBEADDEADDEADDE").unwrap();
+            let trigger_data: Vec<u64> = vec![trigger_pattern; buffer_size as usize / std::mem::size_of::<u64>()];
+            // Move file pointer to 4 KB offset
+            let _pointer = {
+                FileSystem::SetFilePointerEx(
+                    handle,
+                    PAGE_SIZE as i64,
+                    null_mut(),
+                    FileSystem::FILE_BEGIN
+                )
+            };
+            write_buf.copy_from_slice(&trigger_data);
+
+            // Write triggering pattern
+            let write =  {
+                FileSystem::WriteFile(
+                    handle,
+                    write_buffer,
+                    buffer_size as DWORD,
+                    bytes_completed_ptr,
+                    null_mut()
+                )
+            };
+            if write == false {
+                error!("Thread {} encountered Error Code {}", id, win32::last_error());
+                if trigger == Trigger::ExitOnError {
+                    // Clean up resources and close handle
+                    {
+                        VirtualFree(write_buffer, 0, MEM_RELEASE);
+                        Foundation::CloseHandle(handle);
+                    }
+                    return;
+                }
+            }
+
+        }    
+
         write_buf.copy_from_slice(&pattern_data);
     }
     
@@ -629,8 +751,6 @@ fn conduct_data_comparison(sender: std::sync::mpsc::Sender<String>, num_threads:
         };
 
         // I/O logistics
-        let mut bytes_completed: u32 = 0;
-        let bytes_completed_ptr: *mut u32 = &mut bytes_completed;
         let mut pos: u64 = offset;
         let last_pos: u64 = local_limit * id - buffer_size;
         let mut received: u64;
@@ -673,6 +793,15 @@ fn conduct_data_comparison(sender: std::sync::mpsc::Sender<String>, num_threads:
 
                 if write == false {
                     error!("Thread {} encountered Error Code {}", id, win32::last_error());
+                    if trigger == Trigger::ExitOnError {
+                        // Clean up resources and close handle
+                        unsafe {
+                            VirtualFree(read_buffer, 0, MEM_RELEASE);
+                            VirtualFree(write_buffer, 0, MEM_RELEASE);
+                            Foundation::CloseHandle(handle);
+                        }
+                        return;
+                    }
                     break;
                 }
 
@@ -699,6 +828,15 @@ fn conduct_data_comparison(sender: std::sync::mpsc::Sender<String>, num_threads:
 
                 if read == false {
                     error!("Thread {} encountered Error Code {}", id, win32::last_error());
+                    if trigger == Trigger::ExitOnError {
+                        // Clean up resources and close handle
+                        unsafe {
+                            VirtualFree(read_buffer, 0, MEM_RELEASE);
+                            VirtualFree(write_buffer, 0, MEM_RELEASE);
+                            Foundation::CloseHandle(handle);
+                        }
+                        return;
+                    }
                     break;
                 }
 
@@ -716,6 +854,15 @@ fn conduct_data_comparison(sender: std::sync::mpsc::Sender<String>, num_threads:
                         error!(   
                             "Data corruption at offset {}! Thread {}. Actual({:#018x}) vs Expected({:#018x})", pos, id, received, original_pattern
                         );
+                        if trigger == Trigger::ExitOnError {
+                            // Clean up resources and close handle
+                            unsafe {
+                                VirtualFree(read_buffer, 0, MEM_RELEASE);
+                                VirtualFree(write_buffer, 0, MEM_RELEASE);
+                                Foundation::CloseHandle(handle);
+                            }
+                            return;
+                        }
                     }
                     
                 }
@@ -741,6 +888,15 @@ fn conduct_data_comparison(sender: std::sync::mpsc::Sender<String>, num_threads:
 
                 if write == false {
                     error!("Thread {} encountered Error Code {}", id, win32::last_error());
+                    if trigger == Trigger::ExitOnError {
+                        // Clean up resources and close handle
+                        unsafe {
+                            VirtualFree(read_buffer, 0, MEM_RELEASE);
+                            VirtualFree(write_buffer, 0, MEM_RELEASE);
+                            Foundation::CloseHandle(handle);
+                        }
+                        return;
+                    }
                     break;
                 }
                 if time > 0 && now.elapsed().as_secs() > time {
@@ -819,12 +975,29 @@ fn conduct_data_comparison(sender: std::sync::mpsc::Sender<String>, num_threads:
                             error!(   
                                 "Data corruption at offset {}! Iteration {}, Thread {}. Actual({:#018x}) vs Expected({:#018x})", pos, iterations, id, received, original_pattern
                             );
-                        }
-                        
+                            if trigger == Trigger::ExitOnError {
+                                // Clean up resources and close handle
+                                unsafe {
+                                    VirtualFree(read_buffer, 0, MEM_RELEASE);
+                                    VirtualFree(write_buffer, 0, MEM_RELEASE);
+                                    Foundation::CloseHandle(handle);
+                                }
+                                return;
+                            }
+                        } 
                     }
     
                     if read == false {
                         error!("Thread {} encountered Error Code {}", id, win32::last_error());
+                        if trigger == Trigger::ExitOnError {
+                            // Clean up resources and close handle
+                            unsafe {
+                                VirtualFree(read_buffer, 0, MEM_RELEASE);
+                                VirtualFree(write_buffer, 0, MEM_RELEASE);
+                                Foundation::CloseHandle(handle);
+                            }
+                            return;
+                        }
                         break;
                     }
 
@@ -864,6 +1037,15 @@ fn conduct_data_comparison(sender: std::sync::mpsc::Sender<String>, num_threads:
                             error!(   
                                 "Data corruption at offset {}! Iteration {}, Thread {}. Actual({:#018x}) vs Expected({:#018x})", pos, iterations, id, received, original_pattern
                             );
+                            if trigger == Trigger::ExitOnError {
+                                // Clean up resources and close handle
+                                unsafe {
+                                    VirtualFree(read_buffer, 0, MEM_RELEASE);
+                                    VirtualFree(write_buffer, 0, MEM_RELEASE);
+                                    Foundation::CloseHandle(handle);
+                                }
+                                return;
+                            }
                         }
                         
                     }
@@ -871,6 +1053,15 @@ fn conduct_data_comparison(sender: std::sync::mpsc::Sender<String>, num_threads:
                     pos += bytes_completed as u64;
                     if read == false {
                         error!("Thread {} encountered Error Code {}", id, win32::last_error());
+                        if trigger == Trigger::ExitOnError {
+                            // Clean up resources and close handle
+                            unsafe {
+                                VirtualFree(read_buffer, 0, MEM_RELEASE);
+                                VirtualFree(write_buffer, 0, MEM_RELEASE);
+                                Foundation::CloseHandle(handle);
+                            }
+                            return;
+                        }
                         break;
                     }
                     
@@ -899,6 +1090,15 @@ fn conduct_data_comparison(sender: std::sync::mpsc::Sender<String>, num_threads:
 
                         if write == false {
                             error!("Thread {} encountered Error Code {}", id, win32::last_error());
+                            if trigger == Trigger::ExitOnError {
+                                // Clean up resources and close handle
+                                unsafe {
+                                    VirtualFree(read_buffer, 0, MEM_RELEASE);
+                                    VirtualFree(write_buffer, 0, MEM_RELEASE);
+                                    Foundation::CloseHandle(handle);
+                                }
+                                return;
+                            }
                             break;
                         }
                     }
@@ -986,6 +1186,7 @@ fn get_physicaldisk(device_obj: &mut JsonValue, physical_number: u8) {
 
 
 // Parse the output of the PowerShell script (Get-StorageFirmwareInformation)
+#[allow(unused)]
 fn get_storage_firmware_info(device_obj: &mut JsonValue, unique_id: &str) {
     let ps_script = format!("
     $FormatEnumerationLimit = -1
@@ -1037,8 +1238,9 @@ fn parse_script(stdout: &str, id_json: &mut JsonValue) {
                                     get_physicaldisk(&mut device_obj, id_num as u8);
                                 }
                             } else if identifier == "UniqueId" {
-                                let unique_id: &str = item;
-                                get_storage_firmware_info(&mut device_obj, unique_id);
+                                // let unique_id: &str = item;
+                                // get_storage_firmware_info(&mut device_obj, unique_id);
+                                continue;
                             }
                             identifier = "";
                         }
@@ -1111,7 +1313,6 @@ fn get_buffer_size(input: &str) -> u64 {
 }
 
 
-
 // Identifies which data comparison test the program should run
 fn select_test_type(id: u8) -> Test {
     match id {
@@ -1138,6 +1339,27 @@ fn select_test_type(id: u8) -> Test {
         _ => {
             info!("Test ID does not exist, defaulting to write only mode...");
             return Test::WriteOnly;
+        }
+    }
+}
+
+
+// Identifies which trigger should be used
+fn select_trigger_type(id: u8) -> Trigger {
+    match id {
+        0 => {
+            return Trigger::Default;
+        },
+        1 => {
+            info!("Program will exit upon any error or data mismatch");
+            return Trigger::ExitOnError;
+        },
+        2 => {
+            info!("Test: Any Pattern 64 Bit Write and Read/Compare - [>W i*[>r,c]]");
+            return Trigger::TriggerPattern;
+        },
+        _ => {
+            return Trigger::Default;
         }
     }
 }
@@ -1274,7 +1496,6 @@ fn set_thread_group(group: GROUP_AFFINITY) {
 }
 
 
-#[allow(unused)]
 fn id_controller(h_device: Foundation::HANDLE) {
     let status: u32;
 
@@ -1341,7 +1562,7 @@ fn id_controller(h_device: Foundation::HANDLE) {
     
 }
 
-#[allow(unused)]
+
 fn id_namespace(h_device: Foundation::HANDLE) {
     let status: u32;
 
@@ -1442,7 +1663,7 @@ fn get_firmware_info(h_device: Foundation::HANDLE) {
         // Set up the SRB control w/ firmware ioctl info
         srb_control.HeaderLength = size_of::<IscsiDisc::SRB_IO_CONTROL>() as u32;
         srb_control.ControlCode = IscsiDisc::IOCTL_SCSI_MINIPORT;
-        srb_control.Signature = [0; 8];//IscsiDisc::IOCTL_MINIPORT_SIGNATURE_FIRMWARE;
+        srb_control.Signature = ['F' as u8, 'I' as u8, 'R' as u8, 'M' as u8, 'W' as u8, 'A' as u8, 'R' as u8, 'E' as u8];
         srb_control.Timeout = 30;
         srb_control.Length = buffer_length as u32 - size_of::<IscsiDisc::SRB_IO_CONTROL>() as u32;
 
@@ -1472,12 +1693,10 @@ fn get_firmware_info(h_device: Foundation::HANDLE) {
             exit(1);
         }
     
-        let write_buffer_ptr_raw: *mut [u8] = std::ptr::slice_from_raw_parts_mut(buf, buffer_length as usize / std::mem::size_of::<u8>()) as *mut [u8];
-        let write_buf: &mut [u8];
-        let buf_ptr: *mut [u8] = write_buffer_ptr_raw as *mut [u8];
-        write_buf = &mut *buf_ptr;
-
-        // Parse byte output
+        // let write_buffer_ptr_raw: *mut [u8] = std::ptr::slice_from_raw_parts_mut(buf, buffer_length as usize / std::mem::size_of::<u8>()) as *mut [u8];
+        // let write_buf: &mut [u8];
+        // let buf_ptr: *mut [u8] = write_buffer_ptr_raw as *mut [u8];
+        // write_buf = &mut *buf_ptr;
     }
 }
 
@@ -1597,7 +1816,6 @@ fn parse_namespace_buffer(buffer: &mut [u8], offset: usize) {
         NGUID += &format!("{:02X}", buffer[offset + i]);
     }
     println!("Namespace Globally Unique Identifier (NGUID): {}", NGUID);
-
 
     // Print Namespace Utilization
     let mut LBAF0 = String::from("");
