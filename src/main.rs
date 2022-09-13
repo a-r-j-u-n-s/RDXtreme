@@ -536,7 +536,7 @@ fn conduct_io_operation(sender: std::sync::mpsc::Sender<String>, disk_number: u8
                     FileSystem::WriteFile(
                         handle,
                         buffer,
-                        buffer_size as DWORD,
+                        PAGE_SIZE as DWORD,
                         bytes_completed_ptr,
                         null_mut()
                     )
@@ -705,7 +705,7 @@ fn conduct_data_comparison(sender: std::sync::mpsc::Sender<String>, num_threads:
                 FileSystem::WriteFile(
                     handle,
                     write_buffer,
-                    buffer_size as DWORD,
+                    PAGE_SIZE as DWORD,
                     bytes_completed_ptr,
                     null_mut()
                 )
@@ -1355,7 +1355,7 @@ fn select_trigger_type(id: u8) -> Trigger {
             return Trigger::ExitOnError;
         },
         2 => {
-            info!("Test: Any Pattern 64 Bit Write and Read/Compare - [>W i*[>r,c]]");
+            info!("Program will write 0xEFBEADDEADDEADDE to the 4 KB offset");
             return Trigger::TriggerPattern;
         },
         _ => {
