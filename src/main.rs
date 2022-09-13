@@ -529,6 +529,8 @@ fn conduct_io_operation(sender: std::sync::mpsc::Sender<String>, disk_number: u8
                         FileSystem::FILE_BEGIN
                     )
                 };
+
+                // Copy trigger data into buffer
                 write_buf.copy_from_slice(&trigger_data);
 
                 // Write triggering pattern
@@ -549,7 +551,7 @@ fn conduct_io_operation(sender: std::sync::mpsc::Sender<String>, disk_number: u8
                             VirtualFree(buffer, 0, MEM_RELEASE);
                             Foundation::CloseHandle(handle);
                         }
-                        return;
+                        exit(0);
                     }
                 }
             }    
@@ -573,6 +575,7 @@ fn conduct_io_operation(sender: std::sync::mpsc::Sender<String>, disk_number: u8
         let last_pos: u64 = local_limit * id - buffer_size;
 
         if io_type == 'w' {
+            // Conduct write
             now = Instant::now();
             while pos <= last_pos {
                 let write = unsafe {
@@ -593,7 +596,7 @@ fn conduct_io_operation(sender: std::sync::mpsc::Sender<String>, disk_number: u8
                             VirtualFree(buffer, 0, MEM_RELEASE);
                             Foundation::CloseHandle(handle);
                         }
-                        return;
+                        exit(0);
                     }
                     break;
                 }
@@ -604,6 +607,7 @@ fn conduct_io_operation(sender: std::sync::mpsc::Sender<String>, disk_number: u8
             elapsed_time = now.elapsed();
             debug!("Thread {} took {} seconds to finish writing", id, elapsed_time.as_secs());
         } else if io_type == 'r' {
+            // Conduct read
             now = Instant::now();
             while pos <= last_pos {
                 let read = unsafe {
@@ -624,7 +628,7 @@ fn conduct_io_operation(sender: std::sync::mpsc::Sender<String>, disk_number: u8
                             VirtualFree(buffer, 0, MEM_RELEASE);
                             Foundation::CloseHandle(handle);
                         }
-                        return;
+                        exit(0);
                     }
                     break;
                 }
@@ -718,7 +722,7 @@ fn conduct_data_comparison(sender: std::sync::mpsc::Sender<String>, num_threads:
                         VirtualFree(write_buffer, 0, MEM_RELEASE);
                         Foundation::CloseHandle(handle);
                     }
-                    return;
+                    exit(0);
                 }
             }
 
@@ -800,7 +804,7 @@ fn conduct_data_comparison(sender: std::sync::mpsc::Sender<String>, num_threads:
                             VirtualFree(write_buffer, 0, MEM_RELEASE);
                             Foundation::CloseHandle(handle);
                         }
-                        return;
+                        exit(0);
                     }
                     break;
                 }
@@ -835,7 +839,7 @@ fn conduct_data_comparison(sender: std::sync::mpsc::Sender<String>, num_threads:
                             VirtualFree(write_buffer, 0, MEM_RELEASE);
                             Foundation::CloseHandle(handle);
                         }
-                        return;
+                        exit(0);
                     }
                     break;
                 }
@@ -861,7 +865,7 @@ fn conduct_data_comparison(sender: std::sync::mpsc::Sender<String>, num_threads:
                                 VirtualFree(write_buffer, 0, MEM_RELEASE);
                                 Foundation::CloseHandle(handle);
                             }
-                            return;
+                            exit(0);
                         }
                     }
                     
@@ -895,7 +899,7 @@ fn conduct_data_comparison(sender: std::sync::mpsc::Sender<String>, num_threads:
                             VirtualFree(write_buffer, 0, MEM_RELEASE);
                             Foundation::CloseHandle(handle);
                         }
-                        return;
+                        exit(0);
                     }
                     break;
                 }
@@ -982,7 +986,7 @@ fn conduct_data_comparison(sender: std::sync::mpsc::Sender<String>, num_threads:
                                     VirtualFree(write_buffer, 0, MEM_RELEASE);
                                     Foundation::CloseHandle(handle);
                                 }
-                                return;
+                                exit(0);
                             }
                         } 
                     }
@@ -1044,7 +1048,7 @@ fn conduct_data_comparison(sender: std::sync::mpsc::Sender<String>, num_threads:
                                     VirtualFree(write_buffer, 0, MEM_RELEASE);
                                     Foundation::CloseHandle(handle);
                                 }
-                                return;
+                                exit(0);
                             }
                         }
                         
@@ -1060,7 +1064,7 @@ fn conduct_data_comparison(sender: std::sync::mpsc::Sender<String>, num_threads:
                                 VirtualFree(write_buffer, 0, MEM_RELEASE);
                                 Foundation::CloseHandle(handle);
                             }
-                            return;
+                            exit(0);
                         }
                         break;
                     }
@@ -1097,7 +1101,7 @@ fn conduct_data_comparison(sender: std::sync::mpsc::Sender<String>, num_threads:
                                     VirtualFree(write_buffer, 0, MEM_RELEASE);
                                     Foundation::CloseHandle(handle);
                                 }
-                                return;
+                                exit(0);
                             }
                             break;
                         }
@@ -1630,6 +1634,7 @@ fn id_namespace(h_device: Foundation::HANDLE) {
 }
 
 
+// EXPERIMENTAL (9/13/22 - I/O device error (0x45D or 1117))
 fn get_firmware_info(h_device: Foundation::HANDLE) {
     let status: u32;
 
