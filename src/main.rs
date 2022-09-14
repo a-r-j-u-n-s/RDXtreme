@@ -133,7 +133,7 @@ fn main() {
             .short('x')
             .long("trigger")
             .takes_value(true)
-            .help("Triggering data pattern to write at first 4 KB\n0. Default\n1. Exit on any Error\n2. Write 0xEFBEADDEADDEADDE to 4 KB offset"))
+            .help("Triggering data pattern to write at first 4 KB\n0. Default\n1. Exit on any error or data mismatch\n2. Write 0xEFBEADDEADDEADDE to 4 KB offset upon data mismatch"))
         .arg(Arg::new("controller")
             .short('C')
             .long("controller")
@@ -676,58 +676,19 @@ fn conduct_data_comparison(sender: std::sync::mpsc::Sender<String>, num_threads:
         )
     };
 
-    // Keep track bytes completed
+    // Keep track of bytes completed by I/O operations
     let mut bytes_completed: u32 = 0;
     let bytes_completed_ptr: *mut u32 = &mut bytes_completed;
+    let mut bytes_completed_trigger: u32 = 0;
+    let bytes_completed_trigger_ptr: *mut u32 = &mut bytes_completed_trigger;
 
     // Set up references for write buffer and copy pattern data into buffer 
     let write_buffer_ptr_raw: *mut [u64] = std::ptr::slice_from_raw_parts_mut(write_buffer, buffer_size as usize / std::mem::size_of::<u64>()) as *mut [u64];
     let write_buf: &mut [u64];
     unsafe {
-
         // Dereference buffer to add pattern data
         let buf_ptr: *mut [u64] = write_buffer_ptr_raw as *mut [u64];
         write_buf = &mut *buf_ptr;
-
-        // If we are at the first thread, write the triggering data pattern to the 4 KB offset
-        if trigger == Trigger::TriggerPattern && id == 1 {
-            let trigger_pattern = parse_hex("EFBEADDEADDEADDE").unwrap();
-            let trigger_data: Vec<u64> = vec![trigger_pattern; buffer_size as usize / std::mem::size_of::<u64>()];
-            // Move file pointer to 4 KB offset
-            let _pointer = {
-                FileSystem::SetFilePointerEx(
-                    handle,
-                    PAGE_SIZE as i64,
-                    null_mut(),
-                    FileSystem::FILE_BEGIN
-                )
-            };
-            write_buf.copy_from_slice(&trigger_data);
-
-            // Write triggering pattern
-            let write =  {
-                FileSystem::WriteFile(
-                    handle,
-                    write_buffer,
-                    PAGE_SIZE as DWORD,
-                    bytes_completed_ptr,
-                    null_mut()
-                )
-            };
-            if write == false {
-                error!("Thread {} encountered Error Code {}", id, win32::last_error());
-                if trigger == Trigger::ExitOnError {
-                    // Clean up resources and close handle
-                    {
-                        VirtualFree(write_buffer, 0, MEM_RELEASE);
-                        Foundation::CloseHandle(handle);
-                    }
-                    exit(0);
-                }
-            }
-
-        }    
-
         write_buf.copy_from_slice(&pattern_data);
     }
     
@@ -858,6 +819,50 @@ fn conduct_data_comparison(sender: std::sync::mpsc::Sender<String>, num_threads:
                         error!(   
                             "Data corruption at offset {}! Thread {}. Actual({:#018x}) vs Expected({:#018x})", pos, id, received, original_pattern
                         );
+                        // If we encounter a corruption, write the triggering data pattern to the 4 KB offset
+                        if trigger == Trigger::TriggerPattern {
+                            unsafe {
+                                let trigger_pattern = parse_hex("EFBEADDEADDEADDE").unwrap();
+                                let trigger_data: Vec<u64> = vec![trigger_pattern; buffer_size as usize / std::mem::size_of::<u64>()];
+                                // Move file pointer to 4 KB offset
+                                let mut _pointer = {
+                                    FileSystem::SetFilePointerEx(
+                                        handle,
+                                        PAGE_SIZE as i64,
+                                        null_mut(),
+                                        FileSystem::FILE_BEGIN
+                                    )
+                                };
+
+                                // Move trigger pattern to write buffer
+                                write_buf.copy_from_slice(&trigger_data);
+
+                                // Write triggering pattern
+                                let write =  {
+                                    FileSystem::WriteFile(
+                                        handle,
+                                        write_buffer,
+                                        PAGE_SIZE as DWORD,
+                                        bytes_completed_trigger_ptr,
+                                        null_mut()
+                                    )
+                                };
+                                if write == false {
+                                    error!("Thread {} encountered Error Code {}", id, win32::last_error());
+                                    if trigger == Trigger::ExitOnError {
+                                        // Clean up resources and close handle
+                                        {
+                                            VirtualFree(write_buffer, 0, MEM_RELEASE);
+                                            Foundation::CloseHandle(handle);
+                                        }
+                                        exit(0);
+                                    }
+                                }
+
+                                // Replace trigger data with original data
+                                write_buf.copy_from_slice(&pattern_data);
+                            }
+                        }
                         if trigger == Trigger::ExitOnError {
                             // Clean up resources and close handle
                             unsafe {
@@ -868,7 +873,6 @@ fn conduct_data_comparison(sender: std::sync::mpsc::Sender<String>, num_threads:
                             exit(0);
                         }
                     }
-                    
                 }
             }
             break;
@@ -979,6 +983,60 @@ fn conduct_data_comparison(sender: std::sync::mpsc::Sender<String>, num_threads:
                             error!(   
                                 "Data corruption at offset {}! Iteration {}, Thread {}. Actual({:#018x}) vs Expected({:#018x})", pos, iterations, id, received, original_pattern
                             );
+                            // If we encounter a corruption, write the triggering data pattern to the 4 KB offset
+                            if trigger == Trigger::TriggerPattern {
+                                unsafe {
+                                    let trigger_pattern = parse_hex("EFBEADDEADDEADDE").unwrap();
+                                    let trigger_data: Vec<u64> = vec![trigger_pattern; buffer_size as usize / std::mem::size_of::<u64>()];
+                                    // Move file pointer to 4 KB offset
+                                    let mut _pointer = {
+                                        FileSystem::SetFilePointerEx(
+                                            handle,
+                                            PAGE_SIZE as i64,
+                                            null_mut(),
+                                            FileSystem::FILE_BEGIN
+                                        )
+                                    };
+
+                                    // Move trigger pattern to write buffer
+                                    write_buf.copy_from_slice(&trigger_data);
+
+                                    // Write triggering pattern
+                                    let write =  {
+                                        FileSystem::WriteFile(
+                                            handle,
+                                            write_buffer,
+                                            PAGE_SIZE as DWORD,
+                                            bytes_completed_trigger_ptr,
+                                            null_mut()
+                                        )
+                                    };
+                                    if write == false {
+                                        error!("Thread {} encountered Error Code {}", id, win32::last_error());
+                                        if trigger == Trigger::ExitOnError {
+                                            // Clean up resources and close handle
+                                            {
+                                                VirtualFree(write_buffer, 0, MEM_RELEASE);
+                                                Foundation::CloseHandle(handle);
+                                            }
+                                            exit(0);
+                                        }
+                                    }
+
+                                    // Replace trigger data with original data
+                                    write_buf.copy_from_slice(&pattern_data);
+
+                                    // Move file pointer back to original location
+                                    _pointer = {
+                                        FileSystem::SetFilePointerEx(
+                                            handle,
+                                            (offset + INITIALIZATION_OFFSET + random_offset + bytes_completed as u64) as i64,
+                                            null_mut(),
+                                            FileSystem::FILE_BEGIN
+                                        )
+                                    };
+                                }
+                            }
                             if trigger == Trigger::ExitOnError {
                                 // Clean up resources and close handle
                                 unsafe {
@@ -1041,6 +1099,60 @@ fn conduct_data_comparison(sender: std::sync::mpsc::Sender<String>, num_threads:
                             error!(   
                                 "Data corruption at offset {}! Iteration {}, Thread {}. Actual({:#018x}) vs Expected({:#018x})", pos, iterations, id, received, original_pattern
                             );
+                            // If we encounter a corruption, write the triggering data pattern to the 4 KB offset
+                            if trigger == Trigger::TriggerPattern {
+                                unsafe {
+                                    let trigger_pattern = parse_hex("EFBEADDEADDEADDE").unwrap();
+                                    let trigger_data: Vec<u64> = vec![trigger_pattern; buffer_size as usize / std::mem::size_of::<u64>()];
+                                    // Move file pointer to 4 KB offset
+                                    let mut _pointer = {
+                                        FileSystem::SetFilePointerEx(
+                                            handle,
+                                            PAGE_SIZE as i64,
+                                            null_mut(),
+                                            FileSystem::FILE_BEGIN
+                                        )
+                                    };
+
+                                    // Move trigger pattern to write buffer
+                                    write_buf.copy_from_slice(&trigger_data);
+
+                                    // Write triggering pattern
+                                    let write =  {
+                                        FileSystem::WriteFile(
+                                            handle,
+                                            write_buffer,
+                                            PAGE_SIZE as DWORD,
+                                            bytes_completed_trigger_ptr,
+                                            null_mut()
+                                        )
+                                    };
+                                    if write == false {
+                                        error!("Thread {} encountered Error Code {}", id, win32::last_error());
+                                        if trigger == Trigger::ExitOnError {
+                                            // Clean up resources and close handle
+                                            {
+                                                VirtualFree(write_buffer, 0, MEM_RELEASE);
+                                                Foundation::CloseHandle(handle);
+                                            }
+                                            exit(0);
+                                        }
+                                    }
+
+                                    // Replace trigger data with original data
+                                    write_buf.copy_from_slice(&pattern_data);
+
+                                    // Move file pointer back to original location
+                                    _pointer = {
+                                        FileSystem::SetFilePointerEx(
+                                            handle,
+                                            (offset + INITIALIZATION_OFFSET + pos + bytes_completed as u64) as i64,
+                                            null_mut(),
+                                            FileSystem::FILE_BEGIN
+                                        )
+                                    };
+                                }
+                            }
                             if trigger == Trigger::ExitOnError {
                                 // Clean up resources and close handle
                                 unsafe {
@@ -1068,7 +1180,6 @@ fn conduct_data_comparison(sender: std::sync::mpsc::Sender<String>, num_threads:
                         }
                         break;
                     }
-                    
 
                     if test == Test::MovingInversions {
                         // Move pointer back to conduct write
@@ -1359,7 +1470,7 @@ fn select_trigger_type(id: u8) -> Trigger {
             return Trigger::ExitOnError;
         },
         2 => {
-            info!("Program will write 0xEFBEADDEADDEADDE to the 4 KB offset");
+            info!("Program will write 0xEFBEADDEADDEADDE to the 4 KB offset upon any data mismatch");
             return Trigger::TriggerPattern;
         },
         _ => {
