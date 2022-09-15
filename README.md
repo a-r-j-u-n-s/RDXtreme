@@ -111,11 +111,11 @@ This CLI allows you to run multithreaded read/write operations and data comparis
 
 ### **1. Exit on Error**
 
-- Stop all threads on any I/O, miscompare or other error
+- Stop all threads on any data mismatch or other error
 
 ### **2. Triggering Data Pattern**
 
-- Write `0xEFBEADDEADDEADDE` once to the LBA at the 4 KB offset before conducting I/O operations
+- Write `0xEFBEADDEADDEADDE` once to the LBA at the 4 KB offset upon data mismatch
 
 
 
