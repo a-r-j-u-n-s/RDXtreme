@@ -134,7 +134,8 @@ DeviceId FriendlyName         SerialNumber                             MediaType
 ```
 ./rdxtreme.exe --physical-disk 1 --threads 64 --iterations 2 --buffer 4m --test 2 --use-groups --no-compare
 ```
-- Write/read test runs 2 times with a large buffer size and multiple threads. Comparisons disabled for maximum performance
+- Write/read test runs 2 times with a large buffer size and multiple threads
+- Comparisons disabled for maximum performance
 
 
 ### **Stress-Test Drives:**
@@ -142,10 +143,12 @@ DeviceId FriendlyName         SerialNumber                             MediaType
 ./rdxtreme.exe --physical-disk 1 --threads 128 --iterations 5 --pattern 0123456789abcdef --buffer 128k --test 1 --no-compare
 ```
 - Moving inversions data comparison test runs 100 times with many threads and a medium-sized buffer without comparisons
+- Stresses drive
 
 
 ### **Find Hardware Deficiencies:**
 ```
-./rdxtreme.exe --physical-disk 1 --threads 32 --iterations 10 --pattern aaaaaaaaaaaaaaa9 --buffer 16k --test 2 --debug --use-groups
+./rdxtreme.exe --physical-disk 1 --threads 32 --iterations 10 --pattern aaaaaaaaaaaaaaa9 --buffer 16k --test 2 --debug --use-groups -x 3
 ```
-- Read/compare test with a small buffer size and log debug information 
+- Read/compare test with a small buffer size and log debug information
+- Writes triggering data pattern to drive to indicate hardware deficiencies
