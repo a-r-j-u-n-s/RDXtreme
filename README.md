@@ -103,20 +103,19 @@ This CLI allows you to run multithreaded read/write operations and data comparis
 
 - Write, read, and compare full data pattern at random addresses
 
-## _**Triggers**_
+## _**Exit Triggers**_
 
 ### **0. Default**
 
-- Run operations normally
+- Exit on fatal errors only
 
-### **1. Exit on Error**
+### **1. Exit on Any Error**
 
-- Stop all threads on any data mismatch or other error
+- Stop all threads on a data mismatch or any other error
 
 ### **2. Triggering Data Pattern**
 
-- Write `0xEFBEADDEADDEADDE` once to the LBA at the 4 KB offset upon data mismatch
-
+- Write `0xEFBEADDEADDEADDE` once to the LBA at the 4 KB offset upon a data mismatch, "marking" the drive
 
 
 ## _**Use Cases**_
