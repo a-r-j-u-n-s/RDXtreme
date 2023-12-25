@@ -1,6 +1,5 @@
 use windows_drives::{drive::{PhysicalDrive, DiskGeometry}, win32};
 use windows::{core::PCWSTR, Win32::{Storage::{FileSystem, IscsiDisc}, Foundation, System::{Ioctl, IO::DeviceIoControl}}};
-use sysinfo::SystemExt;
 use powershell_script;
 use clap::Arg;
 use std::{time::Instant, mem::{size_of, drop}, ptr::{null_mut, null}, process::exit, thread, string::String, sync::mpsc::{channel, Sender, Receiver}, u32::MAX};

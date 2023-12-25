@@ -6,11 +6,11 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-sysinfo = "0.20.3"
+sysinfo = "0.30.0"
 clap = "3.0.0-beta.4"
 windows-drives = "0.5.0"
 powershell_script = "1.0.2"
-winapi = "0.3.9"
+winapi = { version = "0.3.9", features = ["memoryapi"] }
 affinity = "0.1.2"
 env_logger = "0.9.0"
 log = "0.4.17"
@@ -28,5 +28,5 @@ features = [
     "Win32_System_Threading",
     "Win32_Storage_FileSystem",
     "Win32_System_Ioctl",
-    "Win32_Storage_IscsiDisc"
+    "Win32_Storage_IscsiDisc",
 ]
